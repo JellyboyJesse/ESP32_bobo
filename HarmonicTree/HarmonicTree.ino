@@ -84,6 +84,15 @@ enum Waveform {
 
 static float gWaveTables[WAVE_COUNT][TABLE_SIZE + 1];
 
+// Wavetable erosion ("DNA decay"): the live tables are slowly smoothed
+// while in use and heal back toward this pristine copy when idle. Pristine
+// lives in PSRAM (read-only, occasional) to keep internal RAM for audio.
+static float EXT_RAM_BSS_ATTR gPristine[WAVE_COUNT][TABLE_SIZE + 1];
+static volatile float gErosionAmount = 0.5f;     // 0 = DNA stable, 1 = ages fast
+static const int   EROSION_WINDOW   = 96;         // samples smoothed per event
+static const float EROSION_MAX_SCAR = 0.55f;      // max |deviation| from pristine (no runaway)
+static const float HEAL_RATE        = 0.05f;      // idle-table healing per heal tick
+
 static void addPartial(float* tbl, float ratio, float amp, float phase01) {
   for (uint32_t i = 0; i < TABLE_SIZE; i++) {
     float t = (float)i / (float)TABLE_SIZE;
@@ -534,6 +543,52 @@ static void updateEnvelopes(float dt) {
   gMixGain += (target - gMixGain) * a;
 }
 
+// ----------------------- Wavetable erosion / healing (Core 0) -------
+static bool tableInUse(int w) {
+  for (int i = 0; i < NUM_VOICES; i++)
+    if (gVoices[i].active && (gVoices[i].waveA == w || gVoices[i].waveB == w)) return true;
+  return false;
+}
+
+// Smooth (low-pass) a random window of a random in-use table. Smoothing is
+// continuity-preserving, so it 'scars' the timbre without injecting clicks;
+// the clamp keeps it bounded (no runaway / DC drift). Single float writes
+// are atomic, so the audio core just reads old-or-new, never garbage.
+static void erodeStep() {
+  int inuse[WAVE_COUNT], n = 0;
+  for (int w = 0; w < WAVE_COUNT; w++) if (tableInUse(w)) inuse[n++] = w;
+  if (n == 0) return;
+  int w = inuse[rngNext() % n];
+  float* t = gWaveTables[w];
+  const float* p = gPristine[w];
+  float strength = 0.5f * gErosionAmount;
+  int start = rngNext() & (TABLE_SIZE - 1);
+  for (int k = 0; k < EROSION_WINDOW; k++) {
+    int j  = (start + k) & (TABLE_SIZE - 1);
+    int jm = (j - 1) & (TABLE_SIZE - 1);
+    int jp = (j + 1) & (TABLE_SIZE - 1);
+    float nv = t[j] + strength * (0.5f * (t[jm] + t[jp]) - t[j]);
+    float d = nv - p[j];
+    if (d >  EROSION_MAX_SCAR) nv = p[j] + EROSION_MAX_SCAR;
+    if (d < -EROSION_MAX_SCAR) nv = p[j] - EROSION_MAX_SCAR;
+    t[j] = nv;
+  }
+  t[TABLE_SIZE] = t[0];                    // keep interpolation guard in sync
+}
+
+// Tables no voice is currently using drift back toward pristine (never
+// heard, since nothing reads them). One table per call, round-robin.
+static int gHealCursor = 0;
+static void healStep() {
+  int w = gHealCursor;
+  gHealCursor = (gHealCursor + 1) % WAVE_COUNT;
+  if (tableInUse(w)) return;
+  float* t = gWaveTables[w];
+  const float* p = gPristine[w];
+  for (uint32_t j = 0; j < TABLE_SIZE; j++) t[j] += (p[j] - t[j]) * HEAL_RATE;
+  t[TABLE_SIZE] = t[0];
+}
+
 // ----------------------- Mix one audio block (Core 1) ---------------
 // Forced to -O2 (Arduino defaults to -Os) and pinned in IRAM: this is the
 // hot loop, and the math runs much faster compiled for speed without
@@ -803,6 +858,7 @@ static void controlTask(void* param) {
   rebuildLayout();
 
   uint32_t lastDrawMs = 0, lastFpsMs = 0, frames = 0;
+  uint32_t lastHealMs = 0, lastErodeMs = 0;
   int fps = 0;
   uint32_t lastEnvUs = micros();
 
@@ -847,6 +903,10 @@ static void controlTask(void* param) {
     // --- rebuild layout only when structure changed ---
     if (gTreeDirty) { gTreeDirty = false; rebuildLayout(); }
 
+    // --- wavetable DNA: erode in-use tables, heal idle ones ---
+    if (now - lastHealMs  >= 25)   { lastHealMs  = now; healStep();  }
+    if (now - lastErodeMs >= 2500) { lastErodeMs = now; erodeStep(); }
+
     // --- draw ~60 fps ---
     if (now - lastDrawMs >= 16) {
       lastDrawMs = now;
@@ -873,6 +933,7 @@ void setup() {
   Serial.println("Harmonic Tree v2 - Step 4: gardening");
 
   buildWaveTables();
+  memcpy(gPristine, gWaveTables, sizeof(gWaveTables));   // pristine 'DNA' for healing
   plantSeed();
 
   i2sSetup();
