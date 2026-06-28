@@ -160,7 +160,9 @@ struct Voice {
   float    baseAmp;
   float    env;          // grow/prune envelope 0..1
   float    envTarget;    // 0 = pruning/dead, 1 = alive
-  uint8_t  waveform;
+  uint8_t  waveA, waveB; // morph endpoints (evolution layer 1)
+  float    morphPos;     // 0 = waveA, 1 = waveB (read per-sample by audio)
+  float    morphRate;    // waveforms per second (per-voice)
   bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
@@ -184,8 +186,12 @@ static inline float voiceNextSample(int vi) {
   Voice& v = gVoices[vi];
   uint32_t idx  = v.phase >> FRAC_BITS;
   float    frac = (float)(v.phase & FRAC_MASK) * FRAC_SCALE;
-  const float* t = gWaveTables[v.waveform];
-  float s = t[idx] + (t[idx + 1] - t[idx]) * frac;
+  // crossfade between waveform A and B (evolution layer 1)
+  const float* tA = gWaveTables[v.waveA];
+  const float* tB = gWaveTables[v.waveB];
+  float sA = tA[idx] + (tA[idx + 1] - tA[idx]) * frac;
+  float sB = tB[idx] + (tB[idx + 1] - tB[idx]) * frac;
+  float s = sA + (sB - sA) * v.morphPos;
   v.phase += v.phaseInc;
 
   // per-voice biquad (transposed direct form II); coeffs from the buffer
@@ -243,6 +249,19 @@ static int chooseRatio(float parentFreq) {
   return -1;
 }
 
+// ----------------------- Waveform morphing (layer 1) ----------------
+static float gMorphLiveliness = 1.0f;     // single tuning knob (§6 layer 1)
+
+// Pick the next morph target, weighted by depth: deeper branches reach
+// toward the more complex tables (root drifts among the simple ones).
+static uint8_t pickNextWave(uint8_t depth) {
+  int lo = depth * 2;
+  int hi = lo + 4;                         // a 4-wide window that climbs with depth
+  if (hi > WAVE_COUNT) { hi = WAVE_COUNT; lo = hi - 4; }
+  if (lo < 0) lo = 0;
+  return (uint8_t)(lo + (int)(rngNext() % (uint32_t)(hi - lo)));
+}
+
 // ----------------------- Grow / prune -------------------------------
 static volatile bool gTreeDirty = true;   // rebuild layout when structure changes
 
@@ -260,7 +279,10 @@ static int growBranch(int parent) {
   nv.rNum      = rr.num;
   nv.rDen      = rr.den;
   nv.parent    = (int8_t)parent;
-  nv.waveform  = WAVE_SINE;                 // starts simple; morphs on its own later
+  nv.waveA     = WAVE_SINE;                  // starts simple, morphs from here
+  nv.waveB     = pickNextWave(nv.depth);
+  nv.morphPos  = 0.0f;
+  nv.morphRate = 1.0f / (8.0f + (rngNext() % 2200) * 0.01f);   // one wave per 8..30s
   nv.phaseInc  = freqToInc(nv.freq);
   nv.phase     = rngNext();
   nv.baseAmp   = powf(0.65f, (float)nv.depth);
@@ -295,7 +317,9 @@ static void plantSeed() {
   int v = allocVoice();
   Voice& r = gVoices[v];
   r.depth = 0; r.freq = ROOT_FREQ; r.rNum = 1; r.rDen = 1; r.parent = -1;
-  r.waveform = WAVE_SINE; r.phaseInc = freqToInc(ROOT_FREQ); r.phase = 0;
+  r.waveA = WAVE_SINE; r.waveB = pickNextWave(0); r.morphPos = 0.0f;
+  r.morphRate = 1.0f / 18.0f;
+  r.phaseInc = freqToInc(ROOT_FREQ); r.phase = 0;
   r.baseAmp = 1.0f; r.env = 0.0f; r.envTarget = 1.0f;
   r.z1 = 0.0f; r.z2 = 0.0f; r.coefSel = 0;       // root filter is bypass
   r.coef[0].b0 = 1.0f; r.coef[0].b1 = 0.0f; r.coef[0].b2 = 0.0f;
@@ -359,6 +383,21 @@ static void computeVoiceFilter(int i) {
   v.coefSel = nx;
 }
 
+// Advance one voice's waveform morph. When the blend completes, A takes
+// over from B and a new B is chosen. The order (A<-B, zero the blend,
+// THEN change B) makes B's weight zero exactly when it changes, so the
+// swap is seamless across cores.
+static void advanceMorph(int i, float dt) {
+  Voice& v = gVoices[i];
+  v.morphPos += v.morphRate * gMorphLiveliness * dt;
+  if (v.morphPos >= 1.0f) {
+    v.waveA = v.waveB;
+    v.morphPos = 0.0f;
+    __sync_synchronize();
+    v.waveB = pickNextWave(v.depth);
+  }
+}
+
 static void updateEnvelopes(float dt) {
   float sumAmp = 0.0f;
   for (int i = 0; i < NUM_VOICES; i++) {
@@ -376,7 +415,10 @@ static void updateEnvelopes(float dt) {
       }
     }
     sumAmp += v.baseAmp * v.env;             // current worst-case in-phase peak
-    if (v.active) computeVoiceFilter(i);     // refresh filter (env may have moved)
+    if (v.active) {
+      computeVoiceFilter(i);                 // refresh filter (env may have moved)
+      advanceMorph(i, dt);                   // evolution layer 1: waveform morph
+    }
   }
 
   // Auto-gain toward the headroom budget, smoothed so grow/prune doesn't pump.
