@@ -352,37 +352,26 @@ static void audioTask(void* param) {
 }
 
 // ====================================================================
-//  Encoder — quadrature full-step state machine (ISR on A and B)
+//  Encoder — self-healing quarter-step decoder (ISR on A and B)
+//  Each detent = 4 quarter-steps. We accumulate quarter-steps and the
+//  control task consumes them in groups of 4, KEEPING the remainder, so
+//  an occasionally-missed edge heals on the next detent instead of
+//  dropping a whole step. Illegal (jumped) transitions count as 0.
 // ====================================================================
-#define R_START     0x0
-#define R_CW_FINAL  0x1
-#define R_CW_BEGIN  0x2
-#define R_CW_NEXT   0x3
-#define R_CCW_BEGIN 0x4
-#define R_CCW_FINAL 0x5
-#define R_CCW_NEXT  0x6
-#define DIR_CW      0x10
-#define DIR_CCW     0x20
-
-static const uint8_t kEncTable[7][4] = {
-  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
-  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
-  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
-  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
-  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
-  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
-  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
+static const int8_t kQuadTable[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
 };
 
-static volatile uint8_t gEncState = R_START;
-static volatile int     gEncDelta = 0;       // detents accumulated, consumed by control task
+static volatile uint8_t gEncPrev = 0x3;   // rest state (both HIGH)
+static volatile int     gEncSub  = 0;     // quarter-steps, consumed by control task
 
 static void IRAM_ATTR encISR() {
-  uint8_t pin = (digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B);
-  gEncState = kEncTable[gEncState & 0x07][pin];
-  uint8_t dir = gEncState & 0x30;
-  if (dir == DIR_CW) gEncDelta++;
-  else if (dir == DIR_CCW) gEncDelta--;
+  uint8_t s = (uint8_t)((digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B));
+  gEncSub += kQuadTable[((gEncPrev << 2) | s) & 0x0f];
+  gEncPrev = s;
 }
 
 // Button: 30ms debounce, single event on press (active low).
@@ -545,6 +534,8 @@ static void controlTask(void* param) {
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   pinMode(PIN_ENC_SW, INPUT_PULLUP);
+  delay(2);
+  gEncPrev = (uint8_t)((digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B));
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encISR, CHANGE);
 
@@ -564,16 +555,19 @@ static void controlTask(void* param) {
     if (dt > 0.05f) dt = 0.05f;
     updateEnvelopes(dt);
 
-    // --- encoder rotate: move cursor in spatial order ---
-    int d = gEncDelta;
-    if (d != 0) {
-      gEncDelta = 0;
-      if (gNumTargets > 0) {
-        gCursor = (gCursor + d) % gNumTargets;
-        if (gCursor < 0) gCursor += gNumTargets;
-        gFocusVoice = gTargets[gCursor].voice;
-        gFocusType  = gTargets[gCursor].type;
-      }
+    // --- encoder rotate: 1 detent (4 quarter-steps) = 1 cursor move ---
+    // Consume inside a tiny interrupts-off window so no count is lost to
+    // the ISR; keep the remainder so missed edges self-heal.
+    noInterrupts();
+    int sub = gEncSub;
+    int steps = sub / 4;          // truncates toward zero
+    gEncSub -= steps * 4;         // keep the remainder
+    interrupts();
+    if (steps != 0 && gNumTargets > 0) {
+      gCursor = (gCursor + steps) % gNumTargets;
+      if (gCursor < 0) gCursor += gNumTargets;
+      gFocusVoice = gTargets[gCursor].voice;
+      gFocusType  = gTargets[gCursor].type;
     }
 
     // --- click: grow or prune the selected target ---
