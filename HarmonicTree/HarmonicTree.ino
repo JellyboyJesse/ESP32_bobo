@@ -58,6 +58,11 @@ static const float GAIN_CAP     = 0.40f;             // max gain (few/quiet voic
 static const float MIX_HEADROOM = 0.85f;             // peak budget into the soft clip
 static const float GAIN_TAU     = 0.40f;             // smoothing time constant (s) — no pumping
 static volatile float gMixGain  = GAIN_CAP;          // written by control core, read by audio core
+// Rhythmic pulse / polyrhythm layer
+static volatile float gPulseAmount   = 0.80f;        // dial: 0 = pure drone, 1 = fully rhythmic
+static const float PULSE_BASE_HZ      = 1.0f;        // base pulse rate (× node ratio)
+static const float PULSE_NODE_CHANCE  = 0.70f;       // chance a (non-root) node pulses
+static const float PULSE_RANDOM_CHANCE = 0.12f;      // chance a pulsing node takes a random tempo
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;
@@ -163,6 +168,11 @@ struct Voice {
   uint8_t  waveA, waveB; // morph endpoints (evolution layer 1)
   float    morphPos;     // 0 = waveA, 1 = waveB (read per-sample by audio)
   float    morphRate;    // waveforms per second (per-voice)
+  // rhythmic pulse (polyrhythm layer)
+  float    pulsePhase;   // 0..1 within the pulse period (audio-core state)
+  float    pulseInc;     // per-sample phase increment = rateHz / SR
+  float    pulseAtk;     // attack fraction of the period
+  float    pulseDepth;   // per-node participation: 0 = sustain, 1 = pulses
   bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
@@ -202,7 +212,22 @@ static inline float voiceNextSample(int vi) {
   v.z1 = c.b1 * x - c.a1 * y + v.z2;
   v.z2 = c.b2 * x - c.a2 * y;
 
-  return y * v.env;   // birth/death envelope scales the filtered signal
+  // rhythmic pulse: retriggering attack/decay envelope (polyrhythm layer).
+  // pe = 0..1 within the period; the dial + per-node depth set how deeply
+  // it ducks the amplitude. gPulseAmount 0 -> pure sustain (drone).
+  v.pulsePhase += v.pulseInc;
+  if (v.pulsePhase >= 1.0f) v.pulsePhase -= 1.0f;
+  float pe;
+  if (v.pulsePhase < v.pulseAtk) {
+    pe = v.pulsePhase / v.pulseAtk;                       // attack
+  } else {
+    float r = 1.0f - (v.pulsePhase - v.pulseAtk) / (1.0f - v.pulseAtk);
+    pe = r * r;                                           // decay to 0 by period end
+  }
+  float k = gPulseAmount * v.pulseDepth;
+  float pulseMod = 1.0f - k * (1.0f - pe);                // lerp(sustain, pulse)
+
+  return y * v.env * pulseMod;   // envelope + pulse scale the filtered signal
 }
 
 static int allocVoice() {
@@ -262,6 +287,26 @@ static uint8_t pickNextWave(uint8_t depth) {
   return (uint8_t)(lo + (int)(rngNext() % (uint32_t)(hi - lo)));
 }
 
+// Set up a voice's rhythmic pulse. Tempo is ratio-derived (rate = base ×
+// n/d) so the polyrhythm mirrors the harmony; rarely a node takes a random
+// tempo. The root never pulses — it's the steady drone bed.
+static void initPulse(int i) {
+  Voice& v = gVoices[i];
+  bool pulses = (i != gRootIndex) &&
+                ((rngNext() % 100) < (uint32_t)(PULSE_NODE_CHANCE * 100));
+  v.pulseDepth = pulses ? 1.0f : 0.0f;
+
+  float rateHz;
+  if (pulses && (rngNext() % 100) < (uint32_t)(PULSE_RANDOM_CHANCE * 100)) {
+    rateHz = 0.4f + (rngNext() % 2600) * 0.001f;          // rare wild node: 0.4..3.0 Hz
+  } else {
+    rateHz = PULSE_BASE_HZ * (float)v.rNum / (float)v.rDen;
+  }
+  v.pulseInc   = rateHz / (float)SAMPLE_RATE;
+  v.pulseAtk   = 0.03f + (rngNext() % 220) * 0.001f;       // 0.03..0.25 of period
+  v.pulsePhase = (rngNext() % 1000) * 0.001f;              // random start phase
+}
+
 // ----------------------- Grow / prune -------------------------------
 static volatile bool gTreeDirty = true;   // rebuild layout when structure changes
 
@@ -292,6 +337,7 @@ static int growBranch(int parent) {
   nv.coef[0].b0 = 1.0f; nv.coef[0].b1 = 0.0f; nv.coef[0].b2 = 0.0f;
   nv.coef[0].a1 = 0.0f; nv.coef[0].a2 = 0.0f;
   nv.coef[1] = nv.coef[0];
+  initPulse(v);                              // ratio-derived rhythmic pulse
   __sync_synchronize();                      // publish fields before active=true
   nv.active    = true;                       // Core 1 only renders once this is set
   gTreeDirty   = true;
@@ -325,8 +371,9 @@ static void plantSeed() {
   r.coef[0].b0 = 1.0f; r.coef[0].b1 = 0.0f; r.coef[0].b2 = 0.0f;
   r.coef[0].a1 = 0.0f; r.coef[0].a2 = 0.0f;
   r.coef[1] = r.coef[0];
+  gRootIndex = v;                                 // set before initPulse (root won't pulse)
+  initPulse(v);
   r.active = true;
-  gRootIndex = v;
   gTreeDirty = true;
 }
 
@@ -640,10 +687,20 @@ static void drawScreen(int fps) {
       display.drawLine(gNodeX[p], gNodeY[p] + 1, gNodeX[i], gNodeY[i] + 1);
   }
 
-  // nodes (radius hints at envelope: shrinks while pruning)
+  // nodes: pulsing ones throb with their rhythm; others size with envelope
   for (int i = 0; i < NUM_VOICES; i++) {
     if (!gVoices[i].active) continue;
-    int r = 1 + (int)lroundf(gVoices[i].env);   // 1..2
+    int r;
+    if (gVoices[i].pulseDepth > 0.5f) {
+      float ph = gVoices[i].pulsePhase;          // racy read, fine for a visual
+      float atk = gVoices[i].pulseAtk;
+      float pe;
+      if (ph < atk) pe = ph / atk;
+      else { float q = 1.0f - (ph - atk) / (1.0f - atk); pe = q * q; }
+      r = 1 + (int)lroundf(pe * 2.0f);           // 1..3, throbs in time
+    } else {
+      r = 1 + (int)lroundf(gVoices[i].env);      // 1..2
+    }
     display.fillCircle(gNodeX[i], gNodeY[i], r);
   }
 
