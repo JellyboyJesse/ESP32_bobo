@@ -63,6 +63,8 @@ static volatile float gPulseAmount   = 0.80f;        // dial: 0 = pure drone, 1 
 static const float PULSE_BASE_HZ      = 1.0f;        // base pulse rate (× node ratio)
 static const float PULSE_NODE_CHANCE  = 0.70f;       // chance a (non-root) node pulses
 static const float PULSE_RANDOM_CHANCE = 0.12f;      // chance a pulsing node takes a random tempo
+static volatile float gTempoBase  = 1.0f;            // user tempo (set on the TEMPO page)
+static volatile float gTempoScale = 1.0f;            // live tempo = base × seasonal drift
 // Evolving filter: slow per-voice cutoff wander (control-rate, free on audio core)
 static const float WANDER_DEPTH = 0.35f;             // ± fraction the cutoff drifts
 // Ratio-shift glides (layer 2, 'one-off events')
@@ -198,7 +200,8 @@ struct Voice {
   float    morphRate;    // waveforms per second (per-voice)
   // rhythmic pulse (polyrhythm layer)
   float    pulsePhase;   // 0..1 within the pulse period (audio-core state)
-  float    pulseInc;     // per-sample phase increment = rateHz / SR
+  float    pulseInc;     // per-sample phase increment = rateHz × tempo / SR
+  float    pulseBaseHz;  // un-scaled ratio-derived pulse rate (Hz)
   float    pulseAtk;     // attack fraction of the period
   float    pulseDepth;   // per-node participation: 0 = sustain, 1 = pulses
   float    wanderPhase;  // slow filter-cutoff wander 0..1 (evolving filter)
@@ -343,7 +346,8 @@ static void initPulse(int i) {
   } else {
     rateHz = PULSE_BASE_HZ * (float)v.rNum / (float)v.rDen;
   }
-  v.pulseInc   = rateHz / (float)SAMPLE_RATE;
+  v.pulseBaseHz = rateHz;
+  v.pulseInc    = rateHz * gTempoScale / (float)SAMPLE_RATE;
   v.pulseAtk   = 0.03f + (rngNext() % 220) * 0.001f;       // 0.03..0.25 of period
   v.pulsePhase = (rngNext() % 1000) * 0.001f;              // random start phase
 
@@ -555,6 +559,7 @@ static void advanceSeasons(float dt) {
   gBrightness = 1.0f + 0.35f * c;
   float er = EROSION_BASE * (1.0f + 0.7f * b);
   gErosionAmount = er < 0.0f ? 0.0f : er;
+  gTempoScale = gTempoBase * (1.0f + 0.15f * a);   // gentle seasonal tempo drift
 }
 
 static void updateEnvelopes(float dt) {
@@ -587,6 +592,8 @@ static void updateEnvelopes(float dt) {
       if (v.driftCents >  MAX_DRIFT_CENTS) v.driftCents =  MAX_DRIFT_CENTS;
       if (v.driftCents < -MAX_DRIFT_CENTS) v.driftCents = -MAX_DRIFT_CENTS;
       v.phaseInc = freqToInc(v.freq * exp2f(v.driftCents * (1.0f / 1200.0f)));
+      if (v.pulseDepth > 0.0f)
+        v.pulseInc = v.pulseBaseHz * gTempoScale / (float)SAMPLE_RATE;   // live tempo
 
       // rare bloom gesture: filter swells open, then decays closed
       if (v.bloom > 0.0f) {
@@ -774,7 +781,8 @@ static const int LEFT_MARGIN = 6, COL_W = 23, TOP = 14;
 
 static int gNodeX[NUM_VOICES], gNodeY[NUM_VOICES];
 static bool gIsLeaf[NUM_VOICES];              // childless tips (drawn with a leaf)
-static bool gTuneMode = false;                // root-tuning mode (click root to enter)
+static bool gTuneMode = false;                // tune mode (click root to enter)
+static int  gTunePage = 0;                    // 0 = root note, 1 = tempo
 static const float MIN_ROOT = 33.0f, MAX_ROOT = 220.0f;   // root-note range (Hz)
 
 // Cursor targets: a node, or an empty grow-slot belonging to a parent.
@@ -886,20 +894,38 @@ static void transposeTree(float factor) {
 static void drawTuneScreen() {
   display.clear();
   display.setColor(WHITE);
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 0, "TUNE ROOT");
-  display.drawHorizontalLine(0, 11, SCREEN_W);
+  char big[12], sub[20];
 
-  float hz = gVoices[gRootIndex].freq;
-  char nb[12]; noteName(hz, nb, sizeof(nb));
+  if (gTunePage == 0) {                          // ---- ROOT NOTE ----
+    float hz = gVoices[gRootIndex].freq;
+    noteName(hz, big, sizeof(big));
+    snprintf(sub, sizeof(sub), "%.1f Hz", hz);
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "ROOT NOTE");
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(SCREEN_W, 0, "1/2");
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 53, "rotate=pitch  click=tempo");
+  } else {                                        // ---- TEMPO ----
+    int bpm = (int)lroundf(gTempoBase * PULSE_BASE_HZ * 60.0f);
+    snprintf(big, sizeof(big), "%d", bpm);
+    snprintf(sub, sizeof(sub), "BPM");
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "TEMPO");
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(SCREEN_W, 0, "2/2");
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 53, "rotate=tempo  click=done");
+  }
+
+  display.drawHorizontalLine(0, 11, SCREEN_W);
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 16, nb);
+  display.drawString(64, 16, big);
   display.setFont(ArialMT_Plain_10);
-  char buf[16]; snprintf(buf, sizeof(buf), "%.1f Hz", hz);
-  display.drawString(64, 42, buf);
-  display.drawString(64, 53, "rotate = pitch   click = done");
+  display.drawString(64, 42, sub);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.display();
 }
@@ -1021,13 +1047,18 @@ static void controlTask(void* param) {
     gEncSub -= steps * 4;         // keep the remainder
     interrupts();
     if (steps != 0) {
-      if (gTuneMode) {
+      if (gTuneMode && gTunePage == 0) {
         // transpose the whole tree in semitone steps, clamped to root range
         float f  = powf(2.0f, (float)steps / 12.0f);
         float nr = gVoices[gRootIndex].freq * f;
         if (nr < MIN_ROOT) f = MIN_ROOT / gVoices[gRootIndex].freq;
         if (nr > MAX_ROOT) f = MAX_ROOT / gVoices[gRootIndex].freq;
         transposeTree(f);
+      } else if (gTuneMode && gTunePage == 1) {
+        // adjust master tempo (multiplicative steps), clamped
+        gTempoBase *= powf(2.0f, (float)steps / 12.0f);
+        if (gTempoBase < 0.25f) gTempoBase = 0.25f;
+        if (gTempoBase > 4.0f)  gTempoBase = 4.0f;
       } else if (gNumTargets > 0) {
         gCursor = (gCursor + steps) % gNumTargets;
         if (gCursor < 0) gCursor += gNumTargets;
@@ -1039,14 +1070,15 @@ static void controlTask(void* param) {
     // --- click: grow or prune the selected target ---
     if (buttonClicked() && gNumTargets > 0) {
       if (gTuneMode) {
-        gTuneMode = false;                        // click again exits tuning
+        if (gTunePage == 0) gTunePage = 1;         // root note -> tempo
+        else { gTuneMode = false; gTunePage = 0; } // tempo -> exit
       } else {
         Target t = gTargets[gCursor];
         if (t.type == T_SLOT) {
           int nv = growBranch(t.voice);
           if (nv >= 0) { gFocusVoice = nv; gFocusType = T_NODE; }
         } else if (t.voice == gRootIndex) {
-          gTuneMode = true;                        // click the root to tune the key
+          gTuneMode = true; gTunePage = 0;         // click the root to enter tune
         } else {
           gFocusVoice = gVoices[t.voice].parent;   // cursor falls back to parent
           gFocusType  = T_NODE;
