@@ -191,7 +191,10 @@ static inline uint32_t freqToInc(float hz) {
 }
 
 // Linear-interpolated wavetable read for one voice.
-static inline float voiceNextSample(Voice& v) {
+// Takes a voice *index* (not Voice&) so the Arduino IDE's auto-generated
+// prototypes — emitted above the struct definition — still compile.
+static inline float voiceNextSample(int vi) {
+  Voice& v = gVoices[vi];
   uint32_t idx  = v.phase >> FRAC_BITS;
   float    frac = (float)(v.phase & FRAC_MASK) * FRAC_SCALE;
   const float* t = gWaveTables[v.waveform];
@@ -205,7 +208,7 @@ static void renderBlock(int16_t* out) {
   for (int n = 0; n < BLOCK_FRAMES; n++) {
     float mix = 0.0f;
     for (int v = 0; v < NUM_VOICES; v++)
-      if (gVoices[v].active) mix += voiceNextSample(gVoices[v]);
+      if (gVoices[v].active) mix += voiceNextSample(v);
 
     // soft clip / safety (full mix bus shaping comes in step 7)
     if (mix >  1.0f) mix =  1.0f;
