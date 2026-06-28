@@ -357,6 +357,7 @@ static void drawScreen() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  Serial.setTxTimeoutMs(0);   // non-blocking serial: a stalled USB-CDC write can't freeze the loop
   Serial.println("Harmonic Tree v2 - Step 1: dual-core + fast display");
 
   // ---- Display on core 0 ----
@@ -383,19 +384,43 @@ void setup() {
 }
 
 // --------------------------- Loop (Core 0) --------------------------
+static const uint32_t FRAME_MS = 16;   // ~60 fps cap (UI needs 30-60, not 223)
+
 void loop() {
-  // Draw as fast as we can and measure FPS over 1s windows.
   static uint32_t frames = 0;
   static uint32_t lastFpsMs = 0;
+  static uint32_t lastDrawMs = 0;
+  static uint32_t maxDispUs = 0;   // worst display() time this second
+  static uint32_t maxLoopUs = 0;   // worst whole-loop time this second
 
-  drawScreen();
-  frames++;
-
+  uint32_t loopStart = micros();
   uint32_t now = millis();
+
+  // Capped redraw — gentle on the I2C bus.
+  if (now - lastDrawMs >= FRAME_MS) {
+    lastDrawMs = now;
+    uint32_t t0 = micros();
+    drawScreen();
+    uint32_t dispUs = micros() - t0;
+    if (dispUs > maxDispUs) maxDispUs = dispUs;
+    frames++;
+  }
+
+  uint32_t loopUs = micros() - loopStart;
+  if (loopUs > maxLoopUs) maxLoopUs = loopUs;
+
+  // Once-a-second diagnostics: if fps ever collapses, these say why.
+  // (dispMax near 1,000,000us => I2C stall; loopMax high but dispMax low
+  //  => something outside the draw.)
   if (now - lastFpsMs >= 1000) {
     gFps = (int)frames;
     frames = 0;
     lastFpsMs = now;
-    Serial.printf("FPS: %d   (voices %d)\n", gFps, gNodeCount);
+    Serial.printf("FPS:%d  heap:%u  dispMax:%uus  loopMax:%uus  voices:%d\n",
+                  gFps, (unsigned)ESP.getFreeHeap(), maxDispUs, maxLoopUs, gNodeCount);
+    maxDispUs = 0;
+    maxLoopUs = 0;
   }
+
+  delay(1);   // yield to the idle task (feeds the watchdog), keep the bus calm
 }
