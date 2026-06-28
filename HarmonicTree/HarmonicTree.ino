@@ -150,6 +150,10 @@ static const uint8_t kRatioWeight[] = {  3,    3,    3,    2,    1,    1,    1, 
 static const int NUM_RATIOS = sizeof(kRatios) / sizeof(kRatios[0]);
 
 // ----------------------------- Voices -------------------------------
+// Biquad coefficients (normalized, a0 = 1). Double-buffered per voice so
+// the audio core never reads a half-written (potentially unstable) set.
+struct Biquad { float b0, b1, b2, a1, a2; };
+
 struct Voice {
   uint32_t phase;
   uint32_t phaseInc;
@@ -162,6 +166,10 @@ struct Voice {
   uint8_t  depth;
   uint8_t  rNum, rDen;
   int8_t   parent;
+  // per-voice filter (architecture §4.5)
+  Biquad          coef[2];     // double buffer
+  volatile uint8_t coefSel;    // which buffer the audio core reads (atomic byte)
+  float           z1, z2;      // filter state (audio core only)
 };
 
 static const int NUM_VOICES = 32;
@@ -179,7 +187,16 @@ static inline float voiceNextSample(int vi) {
   const float* t = gWaveTables[v.waveform];
   float s = t[idx] + (t[idx + 1] - t[idx]) * frac;
   v.phase += v.phaseInc;
-  return s * v.baseAmp * v.env;
+
+  // per-voice biquad (transposed direct form II); coeffs from the buffer
+  // the control core last published — always a complete, stable set.
+  const Biquad& c = v.coef[v.coefSel];
+  float x = s * v.baseAmp;
+  float y = c.b0 * x + v.z1;
+  v.z1 = c.b1 * x - c.a1 * y + v.z2;
+  v.z2 = c.b2 * x - c.a2 * y;
+
+  return y * v.env;   // birth/death envelope scales the filtered signal
 }
 
 static int allocVoice() {
@@ -249,6 +266,10 @@ static int growBranch(int parent) {
   nv.baseAmp   = powf(0.65f, (float)nv.depth);
   nv.env       = 0.0f;                       // fade in
   nv.envTarget = 1.0f;
+  nv.z1 = 0.0f; nv.z2 = 0.0f; nv.coefSel = 0;   // start with a clean passthrough filter
+  nv.coef[0].b0 = 1.0f; nv.coef[0].b1 = 0.0f; nv.coef[0].b2 = 0.0f;
+  nv.coef[0].a1 = 0.0f; nv.coef[0].a2 = 0.0f;
+  nv.coef[1] = nv.coef[0];
   __sync_synchronize();                      // publish fields before active=true
   nv.active    = true;                       // Core 1 only renders once this is set
   gTreeDirty   = true;
@@ -276,6 +297,10 @@ static void plantSeed() {
   r.depth = 0; r.freq = ROOT_FREQ; r.rNum = 1; r.rDen = 1; r.parent = -1;
   r.waveform = WAVE_SINE; r.phaseInc = freqToInc(ROOT_FREQ); r.phase = 0;
   r.baseAmp = 1.0f; r.env = 0.0f; r.envTarget = 1.0f;
+  r.z1 = 0.0f; r.z2 = 0.0f; r.coefSel = 0;       // root filter is bypass
+  r.coef[0].b0 = 1.0f; r.coef[0].b1 = 0.0f; r.coef[0].b2 = 0.0f;
+  r.coef[0].a1 = 0.0f; r.coef[0].a2 = 0.0f;
+  r.coef[1] = r.coef[0];
   r.active = true;
   gRootIndex = v;
   gTreeDirty = true;
@@ -283,6 +308,57 @@ static void plantSeed() {
 
 // Advance grow/prune envelopes (control rate, Core 0). Frees pruned
 // voices once they reach silence.
+// Compute this voice's biquad (RBJ cookbook) into the spare buffer, then
+// publish it. Runs at control rate on Core 0. Depth sets the filter type;
+// env ('openness') opens the filter as the branch grows / closes on prune.
+static void computeVoiceFilter(int i) {
+  Voice& v = gVoices[i];
+  uint8_t nx = v.coefSel ^ 1;
+  Biquad& nb = v.coef[nx];
+
+  if (v.depth == 0) {                 // root: flat / bypass
+    nb.b0 = 1.0f; nb.b1 = 0.0f; nb.b2 = 0.0f; nb.a1 = 0.0f; nb.a2 = 0.0f;
+  } else {
+    float open = v.env;               // 0 = dark/closed, 1 = fully open
+    int type; float f0, Q;
+    if (v.depth == 1) {               // gentle low-pass that opens to bright
+      type = 0; Q = 0.707f;
+      float bright = v.freq * 7.0f;
+      if (bright > 14000.0f) bright = 14000.0f;
+      if (bright < 2000.0f)  bright = 2000.0f;
+      f0 = v.freq * 1.5f + (bright - v.freq * 1.5f) * open;
+    } else if (v.depth == 2) {        // band-pass on the voice's ratio freq
+      type = 1; Q = 1.5f;
+      f0 = v.freq * (0.6f + 0.4f * open);
+    } else if (v.depth == 3) {        // band-pass, narrower
+      type = 1; Q = 3.0f;
+      f0 = v.freq * (0.6f + 0.4f * open);
+    } else {                          // depth 4+: high-pass, thins twigs
+      type = 2; Q = 0.707f;
+      f0 = v.freq * (3.0f - 1.7f * open);   // born thin (high), opens lower
+    }
+    if (f0 < 20.0f) f0 = 20.0f;
+    float maxf = SAMPLE_RATE * 0.45f;
+    if (f0 > maxf) f0 = maxf;
+
+    float w0 = 2.0f * (float)M_PI * f0 / (float)SAMPLE_RATE;
+    float cw = cosf(w0), sw = sinf(w0);
+    float alpha = sw / (2.0f * Q);
+    float a0 = 1.0f + alpha;
+    float a1 = -2.0f * cw;
+    float a2 = 1.0f - alpha;
+    float b0, b1, b2;
+    if (type == 0)      { b0 = (1 - cw) * 0.5f; b1 = 1 - cw;  b2 = (1 - cw) * 0.5f; }
+    else if (type == 1) { b0 = alpha;           b1 = 0;       b2 = -alpha;          }
+    else                { b0 = (1 + cw) * 0.5f; b1 = -(1 + cw); b2 = (1 + cw) * 0.5f; }
+    nb.b0 = b0 / a0; nb.b1 = b1 / a0; nb.b2 = b2 / a0;
+    nb.a1 = a1 / a0; nb.a2 = a2 / a0;
+  }
+
+  __sync_synchronize();               // publish coeffs before the select flips
+  v.coefSel = nx;
+}
+
 static void updateEnvelopes(float dt) {
   float sumAmp = 0.0f;
   for (int i = 0; i < NUM_VOICES; i++) {
@@ -300,6 +376,7 @@ static void updateEnvelopes(float dt) {
       }
     }
     sumAmp += v.baseAmp * v.env;             // current worst-case in-phase peak
+    if (v.active) computeVoiceFilter(i);     // refresh filter (env may have moved)
   }
 
   // Auto-gain toward the headroom budget, smoothed so grow/prune doesn't pump.
