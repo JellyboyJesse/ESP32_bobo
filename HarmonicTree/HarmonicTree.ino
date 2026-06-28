@@ -196,7 +196,7 @@ static inline uint32_t freqToInc(float hz) {
   return (uint32_t)((double)hz * 4294967296.0 / (double)SAMPLE_RATE);
 }
 
-static inline float voiceNextSample(int vi) {
+static inline float __attribute__((always_inline)) voiceNextSample(int vi) {
   Voice& v = gVoices[vi];
   uint32_t idx  = v.phase >> FRAC_BITS;
   float    frac = (float)(v.phase & FRAC_MASK) * FRAC_SCALE;
@@ -494,19 +494,24 @@ static void updateEnvelopes(float dt) {
 }
 
 // ----------------------- Mix one audio block (Core 1) ---------------
-static void renderBlock(int16_t* out) {
+// Forced to -O2 (Arduino defaults to -Os) and pinned in IRAM: this is the
+// hot loop, and the math runs much faster compiled for speed without
+// flash-cache stalls. If your toolchain rejects the optimize attribute,
+// delete the __attribute__((optimize("O2"))) token and it still builds.
+static void IRAM_ATTR __attribute__((optimize("O2"))) renderBlock(int16_t* out) {
   for (int n = 0; n < BLOCK_FRAMES; n++) {
     float mix = 0.0f;
     for (int v = 0; v < NUM_VOICES; v++) {
       if (!gVoices[v].active) continue;
       mix += voiceNextSample(v);
     }
-    // Global soft clip (tanh, architecture §4.5): rounds peaks smoothly
-    // instead of hard-clipping them into clicky corners, and gently
-    // self-limits as more branches are added. tanh output is in (-1,1)
-    // so the int16 conversion can never overflow.
-    mix = tanhf(mix * gMixGain);
-    int16_t s = (int16_t)(mix * 32767.0f);
+    // Global soft clip: cheap cubic (tanh-like smooth knee), no per-sample
+    // libm call. Slope is 0 at ±1 so it meets the flat ceiling with no hard
+    // corner -> click-free, and output stays in [-1,1].
+    float xg = mix * gMixGain;
+    if (xg > 1.0f) xg = 1.0f; else if (xg < -1.0f) xg = -1.0f;
+    xg = 1.5f * xg - 0.5f * xg * xg * xg;
+    int16_t s = (int16_t)(xg * 32767.0f);
     out[2 * n]     = s;
     out[2 * n + 1] = s;
   }
