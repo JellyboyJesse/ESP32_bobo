@@ -52,7 +52,12 @@ static const int   MAX_CHILDREN_PER_NODE = 3;        // branch limit per node (Â
 static const float FREQ_CEILING          = 5000.0f;
 static const float GROW_T  = 1.5f;                   // grow fade-in (s)
 static const float PRUNE_T = 1.8f;                   // prune fade-out (s)
-static const float MASTER_GAIN = 0.32f;              // fixed for now (tuned in step 10)
+// Mix auto-gain: keep the worst-case summed peak inside a headroom budget
+// so the signal stays in tanh's gentle region regardless of branch count.
+static const float GAIN_CAP     = 0.40f;             // max gain (few/quiet voices)
+static const float MIX_HEADROOM = 0.85f;             // peak budget into the soft clip
+static const float GAIN_TAU     = 0.40f;             // smoothing time constant (s) â€” no pumping
+static volatile float gMixGain  = GAIN_CAP;          // written by control core, read by audio core
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;
@@ -279,6 +284,7 @@ static void plantSeed() {
 // Advance grow/prune envelopes (control rate, Core 0). Frees pruned
 // voices once they reach silence.
 static void updateEnvelopes(float dt) {
+  float sumAmp = 0.0f;
   for (int i = 0; i < NUM_VOICES; i++) {
     Voice& v = gVoices[i];
     if (!v.active) continue;
@@ -293,7 +299,18 @@ static void updateEnvelopes(float dt) {
         gTreeDirty = true;
       }
     }
+    sumAmp += v.baseAmp * v.env;             // current worst-case in-phase peak
   }
+
+  // Auto-gain toward the headroom budget, smoothed so grow/prune doesn't pump.
+  float target = GAIN_CAP;
+  if (sumAmp > 1e-4f) {
+    float g = MIX_HEADROOM / sumAmp;
+    if (g < target) target = g;
+  }
+  float a = dt / GAIN_TAU;
+  if (a > 1.0f) a = 1.0f;
+  gMixGain += (target - gMixGain) * a;
 }
 
 // ----------------------- Mix one audio block (Core 1) ---------------
@@ -308,7 +325,7 @@ static void renderBlock(int16_t* out) {
     // instead of hard-clipping them into clicky corners, and gently
     // self-limits as more branches are added. tanh output is in (-1,1)
     // so the int16 conversion can never overflow.
-    mix = tanhf(mix * MASTER_GAIN);
+    mix = tanhf(mix * gMixGain);
     int16_t s = (int16_t)(mix * 32767.0f);
     out[2 * n]     = s;
     out[2 * n + 1] = s;
@@ -431,6 +448,8 @@ static int layoutNode(int v) {
   int y;
   if (nc == 0) { y = gLeafStartY + gLeafCursor * gLeafSpacing; gLeafCursor++; }
   else         { y = sum / nc; }
+  if (y < TOP + 2)       y = TOP + 2;          // keep nodes on-screen
+  if (y > SCREEN_H - 3)  y = SCREEN_H - 3;
   gNodeX[v] = LEFT_MARGIN + gVoices[v].depth * COL_W;
   gNodeY[v] = y;
   return y;
@@ -441,7 +460,7 @@ static void rebuildLayout() {
   int usable = SCREEN_H - TOP - 4;
   gLeafSpacing = (leaves > 1) ? usable / leaves : usable / 2;
   if (gLeafSpacing > 14) gLeafSpacing = 14;
-  if (gLeafSpacing < 6)  gLeafSpacing = 6;
+  if (gLeafSpacing < 5)  gLeafSpacing = 5;
   int totalH = gLeafSpacing * (leaves > 1 ? leaves - 1 : 0);
   gLeafStartY = TOP + (usable - totalH) / 2 + 2;
   gLeafCursor = 0;
