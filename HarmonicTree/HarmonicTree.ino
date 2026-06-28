@@ -786,7 +786,8 @@ static int8_t gFocusVoice = -1;
 static uint8_t gFocusType = T_NODE;
 
 // --- tree layout (recompute only when structure changes) ---
-static int gLeafStartY, gLeafSpacing, gLeafCursor;
+static int gColW = 23;              // adaptive horizontal spacing (per depth)
+static int gLeafTotal, gLeafIndex;  // proportional vertical placement
 
 static int countLeaves() {
   int n = 0;
@@ -802,25 +803,32 @@ static int layoutNode(int v) {
   for (int i = 0; i < NUM_VOICES; i++) {
     if (gVoices[i].active && gVoices[i].parent == v) { sum += layoutNode(i); nc++; }
   }
+  int top = TOP + 2, bot = SCREEN_H - 2;
   int y;
-  if (nc == 0) { y = gLeafStartY + gLeafCursor * gLeafSpacing; gLeafCursor++; }
-  else         { y = sum / nc; }
-  if (y < TOP + 2)       y = TOP + 2;          // keep nodes on-screen
-  if (y > SCREEN_H - 3)  y = SCREEN_H - 3;
-  gNodeX[v] = LEFT_MARGIN + gVoices[v].depth * COL_W;
+  if (nc == 0) {
+    // leaves spread proportionally across the tree area -> always fits, no overflow
+    y = (gLeafTotal > 1) ? top + (gLeafIndex * (bot - top)) / (gLeafTotal - 1)
+                         : (top + bot) / 2;
+    gLeafIndex++;
+  } else {
+    y = sum / nc;                              // parents centered on their children
+  }
+  gNodeX[v] = LEFT_MARGIN + gVoices[v].depth * gColW;
   gNodeY[v] = y;
   return y;
 }
 
 static void rebuildLayout() {
-  int leaves = countLeaves();
-  int usable = SCREEN_H - TOP - 4;
-  gLeafSpacing = (leaves > 1) ? usable / leaves : usable / 2;
-  if (gLeafSpacing > 14) gLeafSpacing = 14;
-  if (gLeafSpacing < 5)  gLeafSpacing = 5;
-  int totalH = gLeafSpacing * (leaves > 1 ? leaves - 1 : 0);
-  gLeafStartY = TOP + (usable - totalH) / 2 + 2;
-  gLeafCursor = 0;
+  // adaptive horizontal spacing: span the full width for the current depth
+  int maxDepth = 0;
+  for (int i = 0; i < NUM_VOICES; i++)
+    if (gVoices[i].active && gVoices[i].depth > maxDepth) maxDepth = gVoices[i].depth;
+  gColW = (SCREEN_W - LEFT_MARGIN - 8) / (maxDepth > 0 ? maxDepth : 1);
+  if (gColW > 40) gColW = 40;
+  if (gColW < 14) gColW = 14;
+
+  gLeafTotal = countLeaves();
+  gLeafIndex = 0;
   if (gRootIndex >= 0) layoutNode(gRootIndex);
 
   // Build cursor target list (nodes + one slot per growable node).
@@ -829,7 +837,7 @@ static void rebuildLayout() {
     if (!gVoices[i].active) continue;
     gTargets[gNumTargets++] = { T_NODE, (int8_t)i, gNodeX[i], gNodeY[i] };
     if (canGrow(i)) {
-      int sx = LEFT_MARGIN + (gVoices[i].depth + 1) * COL_W;
+      int sx = LEFT_MARGIN + (gVoices[i].depth + 1) * gColW;
       if (sx > SCREEN_W - 4) sx = SCREEN_W - 4;
       gTargets[gNumTargets++] = { T_SLOT, (int8_t)i, sx, gNodeY[i] };
     }
@@ -854,57 +862,63 @@ static void rebuildLayout() {
 static void drawScreen(int fps) {
   display.clear();
   display.setColor(WHITE);
+  Target& cur = gTargets[gCursor];
+
+  // --- status bar: action (with context) + voices/cap, framed ---
+  char buf[24];
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-
-  // status bar
-  Target& cur = gTargets[gCursor];
-  const char* action = (cur.type == T_SLOT) ? "GROW"
-                       : (cur.voice == gRootIndex ? "ROOT" : "PRUNE");
-  display.drawString(0, 0, action);
-  char buf[20];
-  snprintf(buf, sizeof(buf), "%d voices", activeCount());
+  if (cur.type == T_SLOT)
+    snprintf(buf, sizeof(buf), "GROW");
+  else if (cur.voice == gRootIndex)
+    snprintf(buf, sizeof(buf), "ROOT %dHz", (int)gVoices[cur.voice].freq);
+  else
+    snprintf(buf, sizeof(buf), "PRUNE %u:%u", gVoices[cur.voice].rNum, gVoices[cur.voice].rDen);
+  display.drawString(0, 0, buf);
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  snprintf(buf, sizeof(buf), "%d/%d", activeCount(), NUM_VOICES);
   display.drawString(SCREEN_W, 0, buf);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawHorizontalLine(0, 11, SCREEN_W);
 
-  // edges (parent -> child)
+  // --- trunk stub entering from the left ---
+  if (gRootIndex >= 0)
+    display.drawLine(0, gNodeY[gRootIndex], gNodeX[gRootIndex], gNodeY[gRootIndex]);
+
+  // --- branches (thicker near the trunk, thin at the tips) ---
   for (int i = 0; i < NUM_VOICES; i++) {
     if (!gVoices[i].active) continue;
     int p = gVoices[i].parent;
     if (p < 0) continue;
     display.drawLine(gNodeX[p], gNodeY[p], gNodeX[i], gNodeY[i]);
-    if (gVoices[i].depth <= 1)   // thicken trunk/primary branches
+    if (gVoices[i].depth <= 1)
       display.drawLine(gNodeX[p], gNodeY[p] + 1, gNodeX[i], gNodeY[i] + 1);
   }
 
-  // nodes: pulsing ones throb with their rhythm; others size with envelope
+  // --- nodes: small dots; root larger; pulsing ones flash on the beat ---
   for (int i = 0; i < NUM_VOICES; i++) {
     if (!gVoices[i].active) continue;
-    int r;
+    int r = (i == gRootIndex) ? 2 : 1;
     if (gVoices[i].pulseDepth > 0.5f) {
-      float ph = gVoices[i].pulsePhase;          // racy read, fine for a visual
-      float atk = gVoices[i].pulseAtk;
-      float pe;
+      float ph = gVoices[i].pulsePhase, atk = gVoices[i].pulseAtk, pe;
       if (ph < atk) pe = ph / atk;
       else { float q = 1.0f - (ph - atk) / (1.0f - atk); pe = q * q; }
-      r = 1 + (int)lroundf(pe * 2.0f);           // 1..3, throbs in time
-    } else {
-      r = 1 + (int)lroundf(gVoices[i].env);      // 1..2
+      if (pe > 0.6f) r += 1;                    // brief throb on the beat
     }
     display.fillCircle(gNodeX[i], gNodeY[i], r);
   }
 
-  // empty grow-slots (hollow markers)
-  for (int i = 0; i < gNumTargets; i++)
-    if (gTargets[i].type == T_SLOT)
-      display.drawCircle(gTargets[i].x, gTargets[i].y, 2);
-
-  // cursor: blinking box around the selected target
-  if ((millis() / 350) & 1) {
-    int cx = cur.x, cy = cur.y;
-    display.drawRect(cx - 4, cy - 4, 9, 9);
+  // --- empty grow-slots drawn as '+' marks ---
+  for (int i = 0; i < gNumTargets; i++) {
+    if (gTargets[i].type != T_SLOT) continue;
+    int x = gTargets[i].x, y = gTargets[i].y;
+    display.drawHorizontalLine(x - 2, y, 5);
+    display.drawVerticalLine(x, y - 2, 5);
   }
+
+  // --- cursor: blinking bracket around the selection ---
+  if ((millis() / 300) & 1)
+    display.drawRect(cur.x - 3, cur.y - 3, 7, 7);
 
   display.display();
 }
