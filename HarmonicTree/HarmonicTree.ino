@@ -68,6 +68,20 @@ static const float WANDER_DEPTH = 0.35f;             // ± fraction the cutoff d
 // Ratio-shift glides (layer 2, 'one-off events')
 static volatile float gRetuneLiveliness   = 1.0f;    // scales how often branches retune
 static const float RETUNE_CHANCE_PER_SEC  = 0.018f;  // ~ once per 55s per branch (× liveliness)
+// Per-voice pitch drift (living detune)
+static volatile float gPitchDrift   = 1.0f;          // scales the drift amount
+static const float MAX_DRIFT_CENTS  = 7.0f;
+// Rare 'bloom' gestures (a branch flings its filter open, then closes)
+static const float BLOOM_DEPTH = 3.0f;               // extra cutoff multiplier at full bloom
+static const float BLOOM_TIME  = 3.5f;               // bloom decay time (s)
+static const float BLOOM_CHANCE_PER_SEC = 0.012f;    // per idle branch
+// Seasons: one very slow master LFO that modulates several params (weather)
+static const float SEASON_PERIOD_S      = 200.0f;    // ~3.3 min cycle
+static const float PULSE_AMOUNT_BASE     = 0.70f;
+static const float MORPH_LIVELINESS_BASE = 1.0f;
+static const float EROSION_BASE          = 0.5f;
+static float gSeasonPhase = 0.0f;
+static volatile float gBrightness = 1.0f;            // global filter brightness (driven by seasons)
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;
@@ -192,6 +206,9 @@ struct Voice {
   float    glideFrom, glideTo;  // ratio-shift glide endpoints (Hz, layer 2)
   float    glideProg;    // 0..1 along the glide; >=1 = idle
   float    glideInc;     // progress per second = 1 / glide duration
+  float    driftCents;   // living micro-detune random-walk (pitch drift)
+  float    bloom;        // 0..1 rare filter-swell gesture
+  float    panL, panR;   // stereo pan gains (equal-power)
   bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
@@ -332,6 +349,15 @@ static void initPulse(int i) {
 
   // ratio-shift glide starts idle
   v.glideFrom = v.freq; v.glideTo = v.freq; v.glideProg = 1.0f; v.glideInc = 0.0f;
+
+  v.driftCents = 0.0f;
+  v.bloom      = 0.0f;
+
+  // equal-power stereo pan: root centered, others spread across the field
+  float pan = (i == gRootIndex) ? 0.5f
+              : 0.5f + 0.45f * (((int)(rngNext() % 2001) - 1000) * 0.001f);
+  v.panL = cosf(pan * 1.5708f);
+  v.panR = sinf(pan * 1.5708f);
 }
 
 // ----------------------- Grow / prune -------------------------------
@@ -435,8 +461,10 @@ static void computeVoiceFilter(int i) {
       type = 2; Q = 0.707f;
       f0 = v.freq * (3.0f - 1.7f * open);   // born thin (high), opens lower
     }
-    // evolving filter: slow cutoff wander, unique per voice
-    f0 *= 1.0f + WANDER_DEPTH * sinf(2.0f * (float)M_PI * v.wanderPhase);
+    // evolving filter: global brightness (seasons) × per-voice wander × bloom swell
+    f0 *= gBrightness
+          * (1.0f + WANDER_DEPTH * sinf(2.0f * (float)M_PI * v.wanderPhase))
+          * (1.0f + BLOOM_DEPTH * v.bloom);
 
     if (f0 < 20.0f) f0 = 20.0f;
     float maxf = SAMPLE_RATE * 0.45f;
@@ -499,14 +527,34 @@ static void advanceRetune(int i, float dt) {
     v.glideProg += v.glideInc * dt;
     if (v.glideProg >= 1.0f) { v.glideProg = 1.0f; v.freq = v.glideTo; }
     else v.freq = v.glideFrom * powf(v.glideTo / v.glideFrom, v.glideProg);
-    v.phaseInc = freqToInc(v.freq);            // smooth pitch slide (atomic 32-bit write)
+    // phaseInc is recomputed from v.freq (with drift) once per voice below
   } else if (i != gRootIndex && v.envTarget > 0.5f) {
     float p = RETUNE_CHANCE_PER_SEC * gRetuneLiveliness * dt;
     if ((float)rngNext() / 4294967296.0f < p) startRetune(i);
   }
 }
 
+// One slow master LFO (minutes) nudging several params together: the
+// instrument's 'weather'. Different phase offsets so they don't all peak
+// at once. All cheap, control-rate.
+static void advanceSeasons(float dt) {
+  gSeasonPhase += dt / SEASON_PERIOD_S;
+  if (gSeasonPhase >= 1.0f) gSeasonPhase -= 1.0f;
+  float a = sinf(2.0f * (float)M_PI * gSeasonPhase);
+  float b = sinf(2.0f * (float)M_PI * (gSeasonPhase + 0.33f));
+  float c = sinf(2.0f * (float)M_PI * (gSeasonPhase + 0.66f));
+
+  float pa = PULSE_AMOUNT_BASE * (1.0f + 0.45f * a);
+  gPulseAmount = pa < 0.0f ? 0.0f : (pa > 1.0f ? 1.0f : pa);
+  float ml = MORPH_LIVELINESS_BASE * (1.0f + 0.6f * b);
+  gMorphLiveliness = ml < 0.1f ? 0.1f : ml;
+  gBrightness = 1.0f + 0.35f * c;
+  float er = EROSION_BASE * (1.0f + 0.7f * b);
+  gErosionAmount = er < 0.0f ? 0.0f : er;
+}
+
 static void updateEnvelopes(float dt) {
+  advanceSeasons(dt);
   float sumAmp = 0.0f;
   for (int i = 0; i < NUM_VOICES; i++) {
     Voice& v = gVoices[i];
@@ -527,7 +575,24 @@ static void updateEnvelopes(float dt) {
       v.wanderPhase += v.wanderRate * dt;    // advance evolving-filter wander
       if (v.wanderPhase >= 1.0f) v.wanderPhase -= 1.0f;
       advanceRetune(i, dt);                  // layer 2: occasional ratio-shift glide
-      computeVoiceFilter(i);                 // refresh filter (env/wander/glide moved)
+
+      // living pitch drift: bounded random walk, gently centered
+      float rnd = ((int)(rngNext() % 2001) - 1000) * 0.001f;   // -1..1
+      v.driftCents += rnd * gPitchDrift * dt * 8.0f;
+      v.driftCents *= (1.0f - 0.3f * dt);
+      if (v.driftCents >  MAX_DRIFT_CENTS) v.driftCents =  MAX_DRIFT_CENTS;
+      if (v.driftCents < -MAX_DRIFT_CENTS) v.driftCents = -MAX_DRIFT_CENTS;
+      v.phaseInc = freqToInc(v.freq * exp2f(v.driftCents * (1.0f / 1200.0f)));
+
+      // rare bloom gesture: filter swells open, then decays closed
+      if (v.bloom > 0.0f) {
+        v.bloom -= dt / BLOOM_TIME;
+        if (v.bloom < 0.0f) v.bloom = 0.0f;
+      } else if (i != gRootIndex && v.envTarget > 0.5f) {
+        if ((float)rngNext() / 4294967296.0f < BLOOM_CHANCE_PER_SEC * dt) v.bloom = 1.0f;
+      }
+
+      computeVoiceFilter(i);                 // refresh filter (brightness/wander/bloom/glide)
       advanceMorph(i, dt);                   // evolution layer 1: waveform morph
     }
   }
@@ -594,22 +659,25 @@ static void healStep() {
 // hot loop, and the math runs much faster compiled for speed without
 // flash-cache stalls. If your toolchain rejects the optimize attribute,
 // delete the __attribute__((optimize("O2"))) token and it still builds.
+// Cheap cubic soft clip (tanh-like smooth knee, no libm): slope 0 at ±1 so
+// it meets the flat ceiling with no hard corner -> click-free, output in [-1,1].
+static inline int16_t __attribute__((always_inline)) softClip16(float x) {
+  if (x > 1.0f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
+  x = 1.5f * x - 0.5f * x * x * x;
+  return (int16_t)(x * 32767.0f);
+}
+
 static void IRAM_ATTR __attribute__((optimize("O2"))) renderBlock(int16_t* out) {
   for (int n = 0; n < BLOCK_FRAMES; n++) {
-    float mix = 0.0f;
+    float mixL = 0.0f, mixR = 0.0f;
     for (int v = 0; v < NUM_VOICES; v++) {
       if (!gVoices[v].active) continue;
-      mix += voiceNextSample(v);
+      float o = voiceNextSample(v);          // mono voice output
+      mixL += o * gVoices[v].panL;           // equal-power stereo spread
+      mixR += o * gVoices[v].panR;
     }
-    // Global soft clip: cheap cubic (tanh-like smooth knee), no per-sample
-    // libm call. Slope is 0 at ±1 so it meets the flat ceiling with no hard
-    // corner -> click-free, and output stays in [-1,1].
-    float xg = mix * gMixGain;
-    if (xg > 1.0f) xg = 1.0f; else if (xg < -1.0f) xg = -1.0f;
-    xg = 1.5f * xg - 0.5f * xg * xg * xg;
-    int16_t s = (int16_t)(xg * 32767.0f);
-    out[2 * n]     = s;
-    out[2 * n + 1] = s;
+    out[2 * n]     = softClip16(mixL * gMixGain);
+    out[2 * n + 1] = softClip16(mixR * gMixGain);
   }
 }
 
