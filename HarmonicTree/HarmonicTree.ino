@@ -1,25 +1,24 @@
 // =====================================================================
-//  Harmonic Tree v2 — Step 1: Dual-Core + Fast Display
+//  Harmonic Tree v2 — Step 4: Gardening Interaction
 //  ESP32-S3 DevKitC-1 N16R8
 //
-//  Per architecture doc v2 §3 / §10 step 1 (THE priority):
-//    - audio render in a FreeRTOS task pinned to CORE 1, high priority
-//      (only i2s_write blocks, and only on that core)
-//    - SH1106 display + control on CORE 0, free to run 30+ fps
+//  Per architecture doc v2 §5 / §10 step 4. The core playable loop:
+//    - ROTATE  -> move a selection cursor through the tree, in visual
+//                 (spatial) order, visiting existing branches AND empty
+//                 grow-slots (one slot per node)
+//    - CLICK   -> empty slot   : GROW a new branch (fades in, ratio by
+//                                weighted random, starts as a simple wave)
+//                 existing branch: PRUNE it + all its children (fade out)
+//    Root is the seed and cannot be pruned.
 //
-//  This folds in the already-validated wavetable engine (12 tables) and
-//  static tree/voice pool so there's a real audio load while we prove the
-//  display runs fast and the audio stays clean side by side.
+//  Core split (the v2 priority): audio render task on CORE 1; a dedicated
+//  control task (encoder + envelopes + gardening + display, all the I2C)
+//  on CORE 0. Arduino's loop() (which runs on core 1 by default) is left
+//  idle so it never competes with audio.
 //
-//  Test for this step:
-//    - OLED lights up (finally!) showing FPS + a sweeping bar + voice count
-//    - FPS should read ~30+ (likely much higher) and the bar should sweep
-//      smoothly while the tree drone plays with no clicks/glitches
-//    - serial also prints FPS once a second
-//  If the display is smooth AND audio is clean simultaneously, dual-core
-//  is proven and we build gardening (step 4) on top.
+//  Encoder: quadrature full-step state machine, interrupts on BOTH A & B,
+//  rests at 0b11, one count per detent. Button: 30ms debounce, fire once.
 //
-//  Library: ThingPulse SH1106Wire ("ESP8266 and ESP32 OLED Driver").
 //  CONFIRMED PINS: OLED SDA->8 SCL->9 | DAC DIN->11 BCK->12 LCK->13
 //                  ENC A->4 B->5 SW->6   (GPIO 25/26/27 do NOT exist here)
 // =====================================================================
@@ -35,6 +34,9 @@ static const int PIN_OLED_SCL = 9;
 static const int PIN_BCK = 12;
 static const int PIN_LCK = 13;
 static const int PIN_DIN = 11;
+static const int PIN_ENC_A = 4;
+static const int PIN_ENC_B = 5;
+static const int PIN_ENC_SW = 6;
 
 // ----------------------- Audio configuration ------------------------
 static const uint32_t SAMPLE_RATE   = 44100;
@@ -43,14 +45,17 @@ static const int      DMA_BUF_COUNT = 8;
 static const int      DMA_BUF_LEN   = 256;
 static const int      BLOCK_FRAMES  = 256;
 
-// ----------------------- Tree configuration -------------------------
-static const float ROOT_FREQ      = 110.0f;   // A2 (doc default)
-static const int   TREE_DEPTH      = 4;
-static const float BRANCH_DENSITY  = 0.60f;
-static const float FREQ_CEILING    = 5000.0f;
+// ----------------------- Tree / gardening config --------------------
+static const float ROOT_FREQ            = 110.0f;   // A2
+static const int   MAX_GROW_DEPTH        = 5;        // children may reach depth 5
+static const int   MAX_CHILDREN_PER_NODE = 3;        // branch limit per node (§4.3)
+static const float FREQ_CEILING          = 5000.0f;
+static const float GROW_T  = 1.5f;                   // grow fade-in (s)
+static const float PRUNE_T = 1.8f;                   // prune fade-out (s)
+static const float MASTER_GAIN = 0.32f;              // fixed for now (tuned in step 10)
 
 // ----------------------- Wavetable engine ---------------------------
-static const int      TABLE_BITS = 11;                 // 2^11 = 2048
+static const int      TABLE_BITS = 11;
 static const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
 static const int      FRAC_BITS  = 32 - TABLE_BITS;
 static const uint32_t FRAC_MASK  = (1u << FRAC_BITS) - 1;
@@ -60,11 +65,6 @@ enum Waveform {
   WAVE_SINE = 0, WAVE_SINE_PLUS, WAVE_TRIANGLE, WAVE_SOFT_SAW,
   WAVE_SQUARE, WAVE_SAWTOOTH, WAVE_PULSE25, WAVE_SOFTCLIP,
   WAVE_FORM_3_2, WAVE_FORM_7_4, WAVE_PRIME, WAVE_INHARMONIC, WAVE_COUNT
-};
-
-static const char* kWaveNames[WAVE_COUNT] = {
-  "Sine", "Sine+", "Triangle", "SoftSaw", "Square", "Sawtooth",
-  "Pulse25", "SoftClip", "3:2Form", "7:4Form", "Prime", "Inharm"
 };
 
 static float gWaveTables[WAVE_COUNT][TABLE_SIZE + 1];
@@ -93,53 +93,35 @@ static void buildWaveTables() {
     for (uint32_t i = 0; i <= TABLE_SIZE; i++) gWaveTables[w][i] = 0.0f;
 
   addPartial(gWaveTables[WAVE_SINE], 1.0f, 1.0f, 0.0f);
-
   addPartial(gWaveTables[WAVE_SINE_PLUS], 1.0f, 1.0f, 0.0f);
   addPartial(gWaveTables[WAVE_SINE_PLUS], 2.0f, 0.15f, 0.0f);
-
   for (int n = 1; n <= HMAX; n += 2) {
     float sign = (((n - 1) / 2) & 1) ? -1.0f : 1.0f;
     addPartial(gWaveTables[WAVE_TRIANGLE], (float)n, sign / (float)(n * n), 0.0f);
   }
-
   for (int n = 1; n <= HMAX; n++)
     addPartial(gWaveTables[WAVE_SOFT_SAW], (float)n, 1.0f / (float)(n * n), 0.0f);
-
   for (int n = 1; n <= HMAX; n += 2)
     addPartial(gWaveTables[WAVE_SQUARE], (float)n, 1.0f / (float)n, 0.0f);
-
   for (int n = 1; n <= HMAX; n++)
     addPartial(gWaveTables[WAVE_SAWTOOTH], (float)n, 1.0f / (float)n, 0.0f);
-
-  {
-    const float duty = 0.25f;
+  { const float duty = 0.25f;
     for (int n = 1; n <= HMAX; n++) {
       float a = sinf((float)n * (float)M_PI * duty) / (float)n;
       addPartial(gWaveTables[WAVE_PULSE25], (float)n, a, 0.0f);
-    }
-  }
-
-  {
-    const float drive = 3.0f;
-    float* t = gWaveTables[WAVE_SOFTCLIP];
+    } }
+  { const float drive = 3.0f; float* t = gWaveTables[WAVE_SOFTCLIP];
     for (uint32_t i = 0; i < TABLE_SIZE; i++) {
       float ph = (float)i / (float)TABLE_SIZE;
       t[i] = tanhf(drive * sinf(2.0f * (float)M_PI * ph)) / tanhf(drive);
-    }
-  }
-
+    } }
   addPartial(gWaveTables[WAVE_FORM_3_2], 3.0f, 1.0f, 0.0f);
   addPartial(gWaveTables[WAVE_FORM_3_2], 2.0f, 0.7f, 0.0f);
-
   addPartial(gWaveTables[WAVE_FORM_7_4], 7.0f, 1.0f, 0.0f);
   addPartial(gWaveTables[WAVE_FORM_7_4], 4.0f, 0.7f, 0.0f);
-
-  {
-    const int primes[] = {2, 3, 5, 7, 11, 13};
+  { const int primes[] = {2, 3, 5, 7, 11, 13};
     for (int k = 0; k < 6; k++)
-      addPartial(gWaveTables[WAVE_PRIME], (float)primes[k], 1.0f / (float)primes[k], 0.0f);
-  }
-
+      addPartial(gWaveTables[WAVE_PRIME], (float)primes[k], 1.0f / (float)primes[k], 0.0f); }
   addPartial(gWaveTables[WAVE_INHARMONIC], 1.0f,   1.0f, 0.0f);
   addPartial(gWaveTables[WAVE_INHARMONIC], 2.756f, 0.6f, 0.0f);
   addPartial(gWaveTables[WAVE_INHARMONIC], 4.1f,   0.4f, 0.0f);
@@ -156,21 +138,21 @@ static inline uint32_t rngNext() {
   return x;
 }
 
-// ----------------------- Just-intonation ratios ---------------------
+// ----------------------- Just-intonation ratios (§4.4) --------------
 struct Ratio { uint8_t num, den; };
-static const Ratio kRatios[] = {
-  {2,1}, {3,2}, {4,3}, {5,4}, {7,4}, {6,5}, {9,8}, {11,8}
-};
+static const Ratio   kRatios[]     = { {2,1},{3,2},{4,3},{5,4},{7,4},{6,5},{9,8},{11,8} };
+static const uint8_t kRatioWeight[] = {  3,    3,    3,    2,    1,    1,    1,    1   };
 static const int NUM_RATIOS = sizeof(kRatios) / sizeof(kRatios[0]);
 
 // ----------------------------- Voices -------------------------------
 struct Voice {
   uint32_t phase;
   uint32_t phaseInc;
-  float    baseAmp;     // depth-based level
-  float    env;         // grow/prune envelope (1.0 = fully grown). Used by gardening later.
+  float    baseAmp;
+  float    env;          // grow/prune envelope 0..1
+  float    envTarget;    // 0 = pruning/dead, 1 = alive
   uint8_t  waveform;
-  bool     active;
+  bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
   uint8_t  rNum, rDen;
@@ -179,8 +161,7 @@ struct Voice {
 
 static const int NUM_VOICES = 32;
 static Voice gVoices[NUM_VOICES];
-static volatile int gNodeCount  = 0;
-static float gMasterGain = 0.2f;
+static int   gRootIndex = -1;
 
 static inline uint32_t freqToInc(float hz) {
   return (uint32_t)((double)hz * 4294967296.0 / (double)SAMPLE_RATE);
@@ -196,76 +177,126 @@ static inline float voiceNextSample(int vi) {
   return s * v.baseAmp * v.env;
 }
 
-static uint8_t waveformForVoice(uint8_t depth, uint8_t num, uint8_t den, uint32_t r) {
-  switch (depth) {
-    case 0: return WAVE_SINE;
-    case 1: { const uint8_t o[] = {WAVE_SINE_PLUS, WAVE_TRIANGLE, WAVE_SOFT_SAW}; return o[r % 3]; }
-    case 2: { const uint8_t o[] = {WAVE_SQUARE, WAVE_SAWTOOTH}; return o[r % 2]; }
-    case 3:
-      if (num == 3 && den == 2) return WAVE_FORM_3_2;
-      if (num == 7 && den == 4) return WAVE_FORM_7_4;
-      { const uint8_t o[] = {WAVE_PULSE25, WAVE_FORM_3_2, WAVE_FORM_7_4}; return o[r % 3]; }
-    default: return (r & 1) ? WAVE_PRIME : WAVE_INHARMONIC;
-  }
-}
-
 static int allocVoice() {
   for (int i = 0; i < NUM_VOICES; i++)
     if (!gVoices[i].active) return i;
   return -1;
 }
 
-static void setupVoice(int i, uint8_t depth, float freq,
-                       uint8_t num, uint8_t den, int parent) {
-  Voice& v = gVoices[i];
-  v.depth    = depth;
-  v.freq     = freq;
-  v.rNum     = num;
-  v.rDen     = den;
-  v.parent   = (int8_t)parent;
-  v.waveform = waveformForVoice(depth, num, den, rngNext());
-  v.phaseInc = freqToInc(freq);
-  v.phase    = rngNext();
-  v.baseAmp  = powf(0.65f, (float)depth);
-  v.env      = 1.0f;                          // fully grown (gardening fades come in step 4)
-  v.active   = true;
-  gNodeCount++;
+static int countChildren(int v) {
+  int n = 0;
+  for (int i = 0; i < NUM_VOICES; i++)
+    if (gVoices[i].active && gVoices[i].parent == v) n++;
+  return n;
 }
 
-static void buildTree(uint8_t maxDepth, float rootFreq, float density) {
-  for (int i = 0; i < NUM_VOICES; i++) gVoices[i].active = false;
-  gNodeCount = 0;
+static int activeCount() {
+  int n = 0;
+  for (int i = 0; i < NUM_VOICES; i++) if (gVoices[i].active) n++;
+  return n;
+}
+
+// A node can offer a grow-slot if it's alive (not being pruned) and has
+// room for another child.
+static bool canGrow(int v) {
+  return gVoices[v].active &&
+         gVoices[v].envTarget > 0.5f &&
+         gVoices[v].depth < MAX_GROW_DEPTH &&
+         countChildren(v) < MAX_CHILDREN_PER_NODE;
+}
+
+// Weighted ratio pick among ratios whose child stays under the ceiling.
+static int chooseRatio(float parentFreq) {
+  int total = 0;
+  for (int i = 0; i < NUM_RATIOS; i++)
+    if (parentFreq * kRatios[i].num / kRatios[i].den <= FREQ_CEILING)
+      total += kRatioWeight[i];
+  if (total == 0) return -1;
+  int r = rngNext() % total;
+  for (int i = 0; i < NUM_RATIOS; i++) {
+    if (parentFreq * kRatios[i].num / kRatios[i].den > FREQ_CEILING) continue;
+    if (r < kRatioWeight[i]) return i;
+    r -= kRatioWeight[i];
+  }
+  return -1;
+}
+
+// ----------------------- Grow / prune -------------------------------
+static volatile bool gTreeDirty = true;   // rebuild layout when structure changes
+
+static int growBranch(int parent) {
+  if (!canGrow(parent)) return -1;
+  int gi = chooseRatio(gVoices[parent].freq);
+  if (gi < 0) return -1;
+  int v = allocVoice();
+  if (v < 0) return -1;
+
+  Ratio rr = kRatios[gi];
+  Voice& nv = gVoices[v];
+  nv.depth     = gVoices[parent].depth + 1;
+  nv.freq      = gVoices[parent].freq * (float)rr.num / (float)rr.den;
+  nv.rNum      = rr.num;
+  nv.rDen      = rr.den;
+  nv.parent    = (int8_t)parent;
+  nv.waveform  = WAVE_SINE;                 // starts simple; morphs on its own later
+  nv.phaseInc  = freqToInc(nv.freq);
+  nv.phase     = rngNext();
+  nv.baseAmp   = powf(0.65f, (float)nv.depth);
+  nv.env       = 0.0f;                       // fade in
+  nv.envTarget = 1.0f;
+  __sync_synchronize();                      // publish fields before active=true
+  nv.active    = true;                       // Core 1 only renders once this is set
+  gTreeDirty   = true;
+  return v;
+}
+
+// Mark a branch and all its descendants to fade out; envelope update
+// frees them once silent. Root is protected.
+static void pruneBranch(int v) {
+  if (v == gRootIndex) return;
+  for (int i = 0; i < NUM_VOICES; i++)
+    if (gVoices[i].active && gVoices[i].parent == v) pruneBranch(i);
+  gVoices[v].envTarget = 0.0f;
+}
+
+static void plantSeed() {
+  for (int i = 0; i < NUM_VOICES; i++) {
+    gVoices[i].active = false;
+    gVoices[i].env = 0.0f;
+    gVoices[i].envTarget = 0.0f;
+  }
   gRng = 0x1234ABCDu;
+  int v = allocVoice();
+  Voice& r = gVoices[v];
+  r.depth = 0; r.freq = ROOT_FREQ; r.rNum = 1; r.rDen = 1; r.parent = -1;
+  r.waveform = WAVE_SINE; r.phaseInc = freqToInc(ROOT_FREQ); r.phase = 0;
+  r.baseAmp = 1.0f; r.env = 0.0f; r.envTarget = 1.0f;
+  r.active = true;
+  gRootIndex = v;
+  gTreeDirty = true;
+}
 
-  int queue[NUM_VOICES];
-  int qh = 0, qt = 0;
-
-  int root = allocVoice();
-  setupVoice(root, 0, rootFreq, 1, 1, -1);
-  queue[qt++] = root;
-
-  while (qh < qt) {
-    int p = queue[qh++];
-    if (gVoices[p].depth >= maxDepth) continue;
-
-    int nChildren = 2 + (((rngNext() % 100) < (uint32_t)(density * 100)) ? 1 : 0);
-    for (int c = 0; c < nChildren; c++) {
-      uint32_t r = rngNext();
-      Ratio rr = kRatios[r % NUM_RATIOS];
-      float cf = gVoices[p].freq * (float)rr.num / (float)rr.den;
-      if (cf > FREQ_CEILING) continue;
-
-      int v = allocVoice();
-      if (v < 0) { qh = qt; break; }
-      setupVoice(v, gVoices[p].depth + 1, cf, rr.num, rr.den, p);
-      queue[qt++] = v;
+// Advance grow/prune envelopes (control rate, Core 0). Frees pruned
+// voices once they reach silence.
+static void updateEnvelopes(float dt) {
+  for (int i = 0; i < NUM_VOICES; i++) {
+    Voice& v = gVoices[i];
+    if (!v.active) continue;
+    if (v.env < v.envTarget) {
+      v.env += dt / GROW_T;
+      if (v.env > v.envTarget) v.env = v.envTarget;
+    } else if (v.env > v.envTarget) {
+      v.env -= dt / PRUNE_T;
+      if (v.env <= 0.0015f && v.envTarget == 0.0f) {
+        v.env = 0.0f;
+        v.active = false;                    // returned to pool
+        gTreeDirty = true;
+      }
     }
   }
-
-  gMasterGain = 1.2f / sqrtf((float)(gNodeCount > 0 ? gNodeCount : 1));
 }
 
-// ----------------------- Mix one audio block ------------------------
+// ----------------------- Mix one audio block (Core 1) ---------------
 static void renderBlock(int16_t* out) {
   for (int n = 0; n < BLOCK_FRAMES; n++) {
     float mix = 0.0f;
@@ -273,7 +304,7 @@ static void renderBlock(int16_t* out) {
       if (!gVoices[v].active) continue;
       mix += voiceNextSample(v);
     }
-    mix *= gMasterGain;
+    mix *= MASTER_GAIN;
     if (mix >  1.0f) mix =  1.0f;
     if (mix < -1.0f) mix = -1.0f;
     int16_t s = (int16_t)(mix * 32767.0f);
@@ -309,7 +340,6 @@ static void i2sSetup() {
   i2s_zero_dma_buffer((i2s_port_t)I2S_NUM_PORT);
 }
 
-// --------------------- Core 1 audio render task ---------------------
 static int16_t gBlockBuf[BLOCK_FRAMES * 2];
 
 static void audioTask(void* param) {
@@ -321,106 +351,283 @@ static void audioTask(void* param) {
   }
 }
 
-// ------------------------- Display (Core 0) -------------------------
-// ThingPulse SH1106Wire: constructor (i2c_addr, sda, scl).
+// ====================================================================
+//  Encoder — quadrature full-step state machine (ISR on A and B)
+// ====================================================================
+#define R_START     0x0
+#define R_CW_FINAL  0x1
+#define R_CW_BEGIN  0x2
+#define R_CW_NEXT   0x3
+#define R_CCW_BEGIN 0x4
+#define R_CCW_FINAL 0x5
+#define R_CCW_NEXT  0x6
+#define DIR_CW      0x10
+#define DIR_CCW     0x20
+
+static const uint8_t kEncTable[7][4] = {
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
+};
+
+static volatile uint8_t gEncState = R_START;
+static volatile int     gEncDelta = 0;       // detents accumulated, consumed by control task
+
+static void IRAM_ATTR encISR() {
+  uint8_t pin = (digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B);
+  gEncState = kEncTable[gEncState & 0x07][pin];
+  uint8_t dir = gEncState & 0x30;
+  if (dir == DIR_CW) gEncDelta++;
+  else if (dir == DIR_CCW) gEncDelta--;
+}
+
+// Button: 30ms debounce, single event on press (active low).
+static bool buttonClicked() {
+  static bool lastStable = true;     // pull-up: HIGH = released
+  static bool lastRead = true;
+  static uint32_t lastChange = 0;
+  bool now = digitalRead(PIN_ENC_SW);
+  if (now != lastRead) { lastRead = now; lastChange = millis(); }
+  if (millis() - lastChange > 30 && now != lastStable) {
+    lastStable = now;
+    if (now == false) return true;   // just pressed
+  }
+  return false;
+}
+
+// ====================================================================
+//  Display + layout + cursor (Core 0)
+// ====================================================================
 static SH1106Wire display(0x3c, PIN_OLED_SDA, PIN_OLED_SCL);
 
-static volatile int gFps = 0;   // updated by core 0, shown on screen + serial
+static const int SCREEN_W = 128, SCREEN_H = 64;
+static const int LEFT_MARGIN = 6, COL_W = 23, TOP = 14;
 
-static void drawScreen() {
+static int gNodeX[NUM_VOICES], gNodeY[NUM_VOICES];
+
+// Cursor targets: a node, or an empty grow-slot belonging to a parent.
+enum TargetType { T_NODE, T_SLOT };
+struct Target { uint8_t type; int8_t voice; int x, y; };
+static Target gTargets[NUM_VOICES * 2];
+static int gNumTargets = 0;
+static int gCursor = 0;
+
+// keep cursor near this after a structural rebuild
+static int8_t gFocusVoice = -1;
+static uint8_t gFocusType = T_NODE;
+
+// --- tree layout (recompute only when structure changes) ---
+static int gLeafStartY, gLeafSpacing, gLeafCursor;
+
+static int countLeaves() {
+  int n = 0;
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!gVoices[i].active) continue;
+    if (countChildren(i) == 0) n++;
+  }
+  return n;
+}
+
+static int layoutNode(int v) {
+  int sum = 0, nc = 0;
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (gVoices[i].active && gVoices[i].parent == v) { sum += layoutNode(i); nc++; }
+  }
+  int y;
+  if (nc == 0) { y = gLeafStartY + gLeafCursor * gLeafSpacing; gLeafCursor++; }
+  else         { y = sum / nc; }
+  gNodeX[v] = LEFT_MARGIN + gVoices[v].depth * COL_W;
+  gNodeY[v] = y;
+  return y;
+}
+
+static void rebuildLayout() {
+  int leaves = countLeaves();
+  int usable = SCREEN_H - TOP - 4;
+  gLeafSpacing = (leaves > 1) ? usable / leaves : usable / 2;
+  if (gLeafSpacing > 14) gLeafSpacing = 14;
+  if (gLeafSpacing < 6)  gLeafSpacing = 6;
+  int totalH = gLeafSpacing * (leaves > 1 ? leaves - 1 : 0);
+  gLeafStartY = TOP + (usable - totalH) / 2 + 2;
+  gLeafCursor = 0;
+  if (gRootIndex >= 0) layoutNode(gRootIndex);
+
+  // Build cursor target list (nodes + one slot per growable node).
+  gNumTargets = 0;
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!gVoices[i].active) continue;
+    gTargets[gNumTargets++] = { T_NODE, (int8_t)i, gNodeX[i], gNodeY[i] };
+    if (canGrow(i)) {
+      int sx = LEFT_MARGIN + (gVoices[i].depth + 1) * COL_W;
+      if (sx > SCREEN_W - 4) sx = SCREEN_W - 4;
+      gTargets[gNumTargets++] = { T_SLOT, (int8_t)i, sx, gNodeY[i] };
+    }
+  }
+
+  // Spatial order: sort by x, then y (root->tip, top->bottom).
+  for (int a = 0; a < gNumTargets - 1; a++)
+    for (int b = 0; b < gNumTargets - 1 - a; b++) {
+      Target& p = gTargets[b]; Target& q = gTargets[b + 1];
+      if (p.x > q.x || (p.x == q.x && p.y > q.y)) { Target t = p; p = q; q = t; }
+    }
+
+  // Restore cursor near the focused target.
+  int found = -1;
+  for (int i = 0; i < gNumTargets; i++)
+    if (gTargets[i].voice == gFocusVoice && gTargets[i].type == gFocusType) { found = i; break; }
+  if (found >= 0) gCursor = found;
+  if (gCursor >= gNumTargets) gCursor = gNumTargets - 1;
+  if (gCursor < 0) gCursor = 0;
+}
+
+static void drawScreen(int fps) {
   display.clear();
-
+  display.setColor(WHITE);
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 0, "Harmonic Tree v2");
 
-  char buf[24];
-  snprintf(buf, sizeof(buf), "FPS %d", gFps);
-  display.drawString(0, 12, buf);
+  // status bar
+  Target& cur = gTargets[gCursor];
+  const char* action = (cur.type == T_SLOT) ? "GROW"
+                       : (cur.voice == gRootIndex ? "ROOT" : "PRUNE");
+  display.drawString(0, 0, action);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%d voices", activeCount());
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(SCREEN_W, 0, buf);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-  snprintf(buf, sizeof(buf), "Voices %d", gNodeCount);
-  display.drawString(64, 12, buf);
+  // edges (parent -> child)
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!gVoices[i].active) continue;
+    int p = gVoices[i].parent;
+    if (p < 0) continue;
+    display.drawLine(gNodeX[p], gNodeY[p], gNodeX[i], gNodeY[i]);
+    if (gVoices[i].depth <= 1)   // thicken trunk/primary branches
+      display.drawLine(gNodeX[p], gNodeY[p] + 1, gNodeX[i], gNodeY[i] + 1);
+  }
 
-  // Sweeping bar so the refresh rate is visible to the eye. Position is
-  // time-based, so smooth motion == steady frame pacing.
-  int x = (int)((millis() / 4) % 128);
-  display.drawVerticalLine(x, 28, 12);
-  display.drawRect(0, 28, 128, 12);
+  // nodes (radius hints at envelope: shrinks while pruning)
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!gVoices[i].active) continue;
+    int r = 1 + (int)lroundf(gVoices[i].env);   // 1..2
+    display.fillCircle(gNodeX[i], gNodeY[i], r);
+  }
 
-  // A little "alive" footer.
-  display.drawString(0, 44, "dual-core: audio C1 / disp C0");
+  // empty grow-slots (hollow markers)
+  for (int i = 0; i < gNumTargets; i++)
+    if (gTargets[i].type == T_SLOT)
+      display.drawCircle(gTargets[i].x, gTargets[i].y, 2);
 
-  display.display();   // pushes the frame buffer over I2C
+  // cursor: blinking box around the selected target
+  if ((millis() / 350) & 1) {
+    int cx = cur.x, cy = cur.y;
+    display.drawRect(cx - 4, cy - 4, 9, 9);
+  }
+
+  display.display();
+}
+
+// ====================================================================
+//  Control task (Core 0): encoder, gardening, envelopes, display
+// ====================================================================
+static void controlTask(void* param) {
+  // All I2C lives on this core.
+  display.init();
+  display.flipScreenVertically();
+  Wire.setClock(400000);
+  display.setContrast(255);
+
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encISR, CHANGE);
+
+  rebuildLayout();
+
+  uint32_t lastDrawMs = 0, lastFpsMs = 0, frames = 0;
+  int fps = 0;
+  uint32_t lastEnvUs = micros();
+
+  for (;;) {
+    uint32_t now = millis();
+
+    // --- envelopes ---
+    uint32_t nowUs = micros();
+    float dt = (nowUs - lastEnvUs) * 1e-6f;
+    lastEnvUs = nowUs;
+    if (dt > 0.05f) dt = 0.05f;
+    updateEnvelopes(dt);
+
+    // --- encoder rotate: move cursor in spatial order ---
+    int d = gEncDelta;
+    if (d != 0) {
+      gEncDelta = 0;
+      if (gNumTargets > 0) {
+        gCursor = (gCursor + d) % gNumTargets;
+        if (gCursor < 0) gCursor += gNumTargets;
+        gFocusVoice = gTargets[gCursor].voice;
+        gFocusType  = gTargets[gCursor].type;
+      }
+    }
+
+    // --- click: grow or prune the selected target ---
+    if (buttonClicked() && gNumTargets > 0) {
+      Target t = gTargets[gCursor];
+      if (t.type == T_SLOT) {
+        int nv = growBranch(t.voice);
+        if (nv >= 0) { gFocusVoice = nv; gFocusType = T_NODE; }
+      } else if (t.voice != gRootIndex) {
+        gFocusVoice = gVoices[t.voice].parent;   // cursor falls back to parent
+        gFocusType  = T_NODE;
+        pruneBranch(t.voice);
+      }
+    }
+
+    // --- rebuild layout only when structure changed ---
+    if (gTreeDirty) { gTreeDirty = false; rebuildLayout(); }
+
+    // --- draw ~60 fps ---
+    if (now - lastDrawMs >= 16) {
+      lastDrawMs = now;
+      drawScreen(fps);
+      frames++;
+    }
+    if (now - lastFpsMs >= 1000) {
+      fps = frames; frames = 0; lastFpsMs = now;
+      Serial.printf("FPS:%d heap:%u voices:%d targets:%d cursor:%d\n",
+                    fps, (unsigned)ESP.getFreeHeap(), activeCount(), gNumTargets, gCursor);
+    }
+
+    vTaskDelay(1);   // yield (control task is the only thing on core 0)
+  }
 }
 
 // ------------------------------ Setup -------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.setTxTimeoutMs(0);   // non-blocking serial: a stalled USB-CDC write can't freeze the loop
-  Serial.println("Harmonic Tree v2 - Step 1: dual-core + fast display");
+  Serial.setTxTimeoutMs(0);
+  Serial.println("Harmonic Tree v2 - Step 4: gardening");
 
-  // ---- Display on core 0 ----
-  display.init();
-  display.flipScreenVertically();             // correct orientation (validated)
-  Wire.setClock(400000);                       // 400kHz I2C (doc §3 checklist)
-  display.setContrast(255);
-  display.clear();
-  display.drawString(0, 24, "booting...");
-  display.display();
-
-  // ---- Audio engine ----
   buildWaveTables();
-  buildTree(TREE_DEPTH, ROOT_FREQ, BRANCH_DENSITY);
-  Serial.printf("Tree: %d voices, masterGain=%.3f\n", gNodeCount, gMasterGain);
+  plantSeed();
 
   i2sSetup();
-  // Audio render pinned to CORE 1, high priority — only i2s_write blocks,
-  // and only on that core, so the display on core 0 never stalls.
-  xTaskCreatePinnedToCore(audioTask, "audio", 4096, NULL,
-                          configMAX_PRIORITIES - 1, NULL, 1);
+  // Audio on CORE 1 (high priority); control+display on CORE 0.
+  xTaskCreatePinnedToCore(audioTask,   "audio",   4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
+  xTaskCreatePinnedToCore(controlTask, "control", 8192, NULL, 2,                          NULL, 0);
 
-  Serial.println("Audio on Core 1, display on Core 0. Watch the FPS.");
+  Serial.println("Planted. Rotate to move cursor, click to grow/prune.");
 }
 
-// --------------------------- Loop (Core 0) --------------------------
-static const uint32_t FRAME_MS = 16;   // ~60 fps cap (UI needs 30-60, not 223)
-
 void loop() {
-  static uint32_t frames = 0;
-  static uint32_t lastFpsMs = 0;
-  static uint32_t lastDrawMs = 0;
-  static uint32_t maxDispUs = 0;   // worst display() time this second
-  static uint32_t maxLoopUs = 0;   // worst whole-loop time this second
-
-  uint32_t loopStart = micros();
-  uint32_t now = millis();
-
-  // Capped redraw — gentle on the I2C bus.
-  if (now - lastDrawMs >= FRAME_MS) {
-    lastDrawMs = now;
-    uint32_t t0 = micros();
-    drawScreen();
-    uint32_t dispUs = micros() - t0;
-    if (dispUs > maxDispUs) maxDispUs = dispUs;
-    frames++;
-  }
-
-  uint32_t loopUs = micros() - loopStart;
-  if (loopUs > maxLoopUs) maxLoopUs = loopUs;
-
-  // Once-a-second diagnostics: if fps ever collapses, these say why.
-  // (dispMax near 1,000,000us => I2C stall; loopMax high but dispMax low
-  //  => something outside the draw.)
-  if (now - lastFpsMs >= 1000) {
-    gFps = (int)frames;
-    frames = 0;
-    lastFpsMs = now;
-    Serial.printf("FPS:%d  heap:%u  dispMax:%uus  loopMax:%uus  voices:%d\n",
-                  gFps, (unsigned)ESP.getFreeHeap(), maxDispUs, maxLoopUs, gNodeCount);
-    maxDispUs = 0;
-    maxLoopUs = 0;
-  }
-
-  delay(1);   // yield to the idle task (feeds the watchdog), keep the bus calm
+  // Unused: everything runs in the two pinned tasks. Keep core 1's
+  // Arduino loopTask idle so it never competes with audio.
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
