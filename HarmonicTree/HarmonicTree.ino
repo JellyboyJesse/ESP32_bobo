@@ -1,28 +1,40 @@
 // =====================================================================
-//  Harmonic Tree — Step 3: Tree Builder
+//  Harmonic Tree v2 — Step 1: Dual-Core + Fast Display
 //  ESP32-S3 DevKitC-1 N16R8
 //
-//  Per architecture doc §4.2 / §4.3 / §11 step 3:
-//    - 32-voice pool
-//    - breadth-first branch generator: child freq = parent x ratio
-//    - just-intonation ratio set, two children always + a third
-//      "middle shoot" at the branch-density probability
-//    - seeded PRNG so the tree shape is deterministic each build (§6)
-//    - per-depth waveform assignment; ratio-derived voices (3:2, 7:4)
-//      use their matching wavetable
+//  Per architecture doc v2 §3 / §10 step 1 (THE priority):
+//    - audio render in a FreeRTOS task pinned to CORE 1, high priority
+//      (only i2s_write blocks, and only on that core)
+//    - SH1106 display + control on CORE 0, free to run 30+ fps
 //
-//  Test for this step: builds one static, fully-grown tree at startup,
-//  plays it as a sustained chord, and prints the whole tree over serial
-//  (depth / ratio / freq / waveform / parent). Verify the ratio math in
-//  the serial log; the audio should be a clean, dense drone. Birth/death
-//  lifecycle and the stage machine arrive in step 4.
+//  This folds in the already-validated wavetable engine (12 tables) and
+//  static tree/voice pool so there's a real audio load while we prove the
+//  display runs fast and the audio stays clean side by side.
 //
-//  NOTE ON PINS: doc §2 lists DAC on GPIO 25/26/27 which do NOT exist on
-//  this board. Real tested wiring used below: DIN->11 BCK->12 LCK->13.
+//  Test for this step:
+//    - OLED lights up (finally!) showing FPS + a sweeping bar + voice count
+//    - FPS should read ~30+ (likely much higher) and the bar should sweep
+//      smoothly while the tree drone plays with no clicks/glitches
+//    - serial also prints FPS once a second
+//  If the display is smooth AND audio is clean simultaneously, dual-core
+//  is proven and we build gardening (step 4) on top.
+//
+//  Library: ThingPulse SH1106Wire ("ESP8266 and ESP32 OLED Driver").
+//  CONFIRMED PINS: OLED SDA->8 SCL->9 | DAC DIN->11 BCK->12 LCK->13
+//                  ENC A->4 B->5 SW->6   (GPIO 25/26/27 do NOT exist here)
 // =====================================================================
 
 #include "driver/i2s.h"
+#include <Wire.h>
+#include "SH1106Wire.h"
 #include <math.h>
+
+// ----------------------- Pins ---------------------------------------
+static const int PIN_OLED_SDA = 8;
+static const int PIN_OLED_SCL = 9;
+static const int PIN_BCK = 12;
+static const int PIN_LCK = 13;
+static const int PIN_DIN = 11;
 
 // ----------------------- Audio configuration ------------------------
 static const uint32_t SAMPLE_RATE   = 44100;
@@ -31,20 +43,16 @@ static const int      DMA_BUF_COUNT = 8;
 static const int      DMA_BUF_LEN   = 256;
 static const int      BLOCK_FRAMES  = 256;
 
-static const int PIN_BCK = 12;
-static const int PIN_LCK = 13;
-static const int PIN_DIN = 11;
-
 // ----------------------- Tree configuration -------------------------
-static const float ROOT_FREQ     = 110.0f;   // A2 (doc default)
-static const int   MAX_DEPTH      = 4;        // Mature stage (§6); pool also caps growth
-static const float BRANCH_DENSITY = 0.60f;    // P(third middle shoot) (§4.3)
-static const float FREQ_CEILING   = 5000.0f;  // don't spawn branches above this
+static const float ROOT_FREQ      = 110.0f;   // A2 (doc default)
+static const int   TREE_DEPTH      = 4;
+static const float BRANCH_DENSITY  = 0.60f;
+static const float FREQ_CEILING    = 5000.0f;
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;                 // 2^11 = 2048
 static const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
-static const int      FRAC_BITS  = 32 - TABLE_BITS;    // 21
+static const int      FRAC_BITS  = 32 - TABLE_BITS;
 static const uint32_t FRAC_MASK  = (1u << FRAC_BITS) - 1;
 static const float    FRAC_SCALE = 1.0f / (float)(1u << FRAC_BITS);
 
@@ -140,7 +148,6 @@ static void buildWaveTables() {
 }
 
 // ----------------------- Seeded PRNG (xorshift32) -------------------
-// Deterministic tree shape each build (§6). Same seed -> same tree.
 static uint32_t gRng = 0x1234ABCDu;
 static inline uint32_t rngNext() {
   uint32_t x = gRng;
@@ -149,7 +156,7 @@ static inline uint32_t rngNext() {
   return x;
 }
 
-// ----------------------- Just-intonation ratios (§4.3) --------------
+// ----------------------- Just-intonation ratios ---------------------
 struct Ratio { uint8_t num, den; };
 static const Ratio kRatios[] = {
   {2,1}, {3,2}, {4,3}, {5,4}, {7,4}, {6,5}, {9,8}, {11,8}
@@ -160,20 +167,20 @@ static const int NUM_RATIOS = sizeof(kRatios) / sizeof(kRatios[0]);
 struct Voice {
   uint32_t phase;
   uint32_t phaseInc;
-  float    amplitude;   // 0..1
+  float    baseAmp;     // depth-based level
+  float    env;         // grow/prune envelope (1.0 = fully grown). Used by gardening later.
   uint8_t  waveform;
   bool     active;
-  // tree metadata
   float    freq;
   uint8_t  depth;
   uint8_t  rNum, rDen;
-  int8_t   parent;      // voice index, -1 for root
+  int8_t   parent;
 };
 
-static const int NUM_VOICES = 32;            // pool ceiling (§4.2)
+static const int NUM_VOICES = 32;
 static Voice gVoices[NUM_VOICES];
-static int   gActiveCount = 0;
-static float gMasterGain  = 0.25f;
+static volatile int gNodeCount  = 0;
+static float gMasterGain = 0.2f;
 
 static inline uint32_t freqToInc(float hz) {
   return (uint32_t)((double)hz * 4294967296.0 / (double)SAMPLE_RATE);
@@ -186,11 +193,9 @@ static inline float voiceNextSample(int vi) {
   const float* t = gWaveTables[v.waveform];
   float s = t[idx] + (t[idx + 1] - t[idx]) * frac;
   v.phase += v.phaseInc;
-  return s * v.amplitude;
+  return s * v.baseAmp * v.env;
 }
 
-// Waveform assignment by depth (§4.1). Ratio-derived voices use the
-// matching table so timbre and pitch share the same integers.
 static uint8_t waveformForVoice(uint8_t depth, uint8_t num, uint8_t den, uint32_t r) {
   switch (depth) {
     case 0: return WAVE_SINE;
@@ -220,18 +225,17 @@ static void setupVoice(int i, uint8_t depth, float freq,
   v.parent   = (int8_t)parent;
   v.waveform = waveformForVoice(depth, num, den, rngNext());
   v.phaseInc = freqToInc(freq);
-  v.phase    = rngNext();                    // random start phase decorrelates voices
-  v.amplitude = powf(0.65f, (float)depth);   // deeper branches quieter
+  v.phase    = rngNext();
+  v.baseAmp  = powf(0.65f, (float)depth);
+  v.env      = 1.0f;                          // fully grown (gardening fades come in step 4)
   v.active   = true;
-  gActiveCount++;
+  gNodeCount++;
 }
 
-// Breadth-first tree builder. Returns when the pool is full or no node
-// has room to branch within MAX_DEPTH / FREQ_CEILING.
 static void buildTree(uint8_t maxDepth, float rootFreq, float density) {
   for (int i = 0; i < NUM_VOICES; i++) gVoices[i].active = false;
-  gActiveCount = 0;
-  gRng = 0x1234ABCDu;                         // reset seed -> deterministic shape
+  gNodeCount = 0;
+  gRng = 0x1234ABCDu;
 
   int queue[NUM_VOICES];
   int qh = 0, qt = 0;
@@ -249,44 +253,29 @@ static void buildTree(uint8_t maxDepth, float rootFreq, float density) {
       uint32_t r = rngNext();
       Ratio rr = kRatios[r % NUM_RATIOS];
       float cf = gVoices[p].freq * (float)rr.num / (float)rr.den;
-      if (cf > FREQ_CEILING) continue;        // too high — skip this branch
+      if (cf > FREQ_CEILING) continue;
 
       int v = allocVoice();
-      if (v < 0) { qh = qt; break; }          // pool full — stop building
+      if (v < 0) { qh = qt; break; }
       setupVoice(v, gVoices[p].depth + 1, cf, rr.num, rr.den, p);
       queue[qt++] = v;
     }
   }
 
-  // Master gain keeps the summed chord in range; soft clip catches peaks.
-  gMasterGain = 0.9f / sqrtf((float)(gActiveCount > 0 ? gActiveCount : 1));
-}
-
-static void printTree() {
-  Serial.printf("\n=== Tree built: %d voices (maxDepth=%d, density=%.2f) ===\n",
-                gActiveCount, MAX_DEPTH, BRANCH_DENSITY);
-  Serial.println("idx depth ratio   freq(Hz)  waveform   parent");
-  for (int i = 0; i < NUM_VOICES; i++) {
-    if (!gVoices[i].active) continue;
-    Voice& v = gVoices[i];
-    Serial.printf("%2d   d%d   %2u:%-2u  %8.2f  %-9s  %d\n",
-                  i, v.depth, v.rNum, v.rDen, v.freq,
-                  kWaveNames[v.waveform], v.parent);
-  }
-  Serial.printf("masterGain=%.4f\n\n", gMasterGain);
+  gMasterGain = 1.2f / sqrtf((float)(gNodeCount > 0 ? gNodeCount : 1));
 }
 
 // ----------------------- Mix one audio block ------------------------
 static void renderBlock(int16_t* out) {
   for (int n = 0; n < BLOCK_FRAMES; n++) {
     float mix = 0.0f;
-    for (int v = 0; v < NUM_VOICES; v++)
-      if (gVoices[v].active) mix += voiceNextSample(v);
-
+    for (int v = 0; v < NUM_VOICES; v++) {
+      if (!gVoices[v].active) continue;
+      mix += voiceNextSample(v);
+    }
     mix *= gMasterGain;
-    if (mix >  1.0f) mix =  1.0f;             // soft clip / safety (full shaping in step 7)
+    if (mix >  1.0f) mix =  1.0f;
     if (mix < -1.0f) mix = -1.0f;
-
     int16_t s = (int16_t)(mix * 32767.0f);
     out[2 * n]     = s;
     out[2 * n + 1] = s;
@@ -332,29 +321,81 @@ static void audioTask(void* param) {
   }
 }
 
+// ------------------------- Display (Core 0) -------------------------
+// ThingPulse SH1106Wire: constructor (i2c_addr, sda, scl).
+static SH1106Wire display(0x3c, PIN_OLED_SDA, PIN_OLED_SCL);
+
+static volatile int gFps = 0;   // updated by core 0, shown on screen + serial
+
+static void drawScreen() {
+  display.clear();
+
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawString(0, 0, "Harmonic Tree v2");
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "FPS %d", gFps);
+  display.drawString(0, 12, buf);
+
+  snprintf(buf, sizeof(buf), "Voices %d", gNodeCount);
+  display.drawString(64, 12, buf);
+
+  // Sweeping bar so the refresh rate is visible to the eye. Position is
+  // time-based, so smooth motion == steady frame pacing.
+  int x = (int)((millis() / 4) % 128);
+  display.drawVerticalLine(x, 28, 12);
+  display.drawRect(0, 28, 128, 12);
+
+  // A little "alive" footer.
+  display.drawString(0, 44, "dual-core: audio C1 / disp C0");
+
+  display.display();   // pushes the frame buffer over I2C
+}
+
 // ------------------------------ Setup -------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("Harmonic Tree - Step 3: tree builder");
+  Serial.println("Harmonic Tree v2 - Step 1: dual-core + fast display");
 
+  // ---- Display on core 0 ----
+  display.init();
+  display.flipScreenVertically();             // correct orientation (validated)
+  Wire.setClock(400000);                       // 400kHz I2C (doc §3 checklist)
+  display.setContrast(255);
+  display.clear();
+  display.drawString(0, 24, "booting...");
+  display.display();
+
+  // ---- Audio engine ----
   buildWaveTables();
-  Serial.println("12 wavetables built.");
-
-  buildTree(MAX_DEPTH, ROOT_FREQ, BRANCH_DENSITY);
-  printTree();
+  buildTree(TREE_DEPTH, ROOT_FREQ, BRANCH_DENSITY);
+  Serial.printf("Tree: %d voices, masterGain=%.3f\n", gNodeCount, gMasterGain);
 
   i2sSetup();
+  // Audio render pinned to CORE 1, high priority — only i2s_write blocks,
+  // and only on that core, so the display on core 0 never stalls.
   xTaskCreatePinnedToCore(audioTask, "audio", 4096, NULL,
                           configMAX_PRIORITIES - 1, NULL, 1);
-  Serial.println("Audio on Core 1. Static tree playing as a drone.");
+
+  Serial.println("Audio on Core 1, display on Core 0. Watch the FPS.");
 }
 
+// --------------------------- Loop (Core 0) --------------------------
 void loop() {
-  static uint32_t last = 0;
-  if (millis() - last > 5000) {
-    last = millis();
-    Serial.printf("running... %d voices active\n", gActiveCount);
+  // Draw as fast as we can and measure FPS over 1s windows.
+  static uint32_t frames = 0;
+  static uint32_t lastFpsMs = 0;
+
+  drawScreen();
+  frames++;
+
+  uint32_t now = millis();
+  if (now - lastFpsMs >= 1000) {
+    gFps = (int)frames;
+    frames = 0;
+    lastFpsMs = now;
+    Serial.printf("FPS: %d   (voices %d)\n", gFps, gNodeCount);
   }
-  delay(50);
 }
