@@ -304,9 +304,11 @@ static void renderBlock(int16_t* out) {
       if (!gVoices[v].active) continue;
       mix += voiceNextSample(v);
     }
-    mix *= MASTER_GAIN;
-    if (mix >  1.0f) mix =  1.0f;
-    if (mix < -1.0f) mix = -1.0f;
+    // Global soft clip (tanh, architecture §4.5): rounds peaks smoothly
+    // instead of hard-clipping them into clicky corners, and gently
+    // self-limits as more branches are added. tanh output is in (-1,1)
+    // so the int16 conversion can never overflow.
+    mix = tanhf(mix * MASTER_GAIN);
     int16_t s = (int16_t)(mix * 32767.0f);
     out[2 * n]     = s;
     out[2 * n + 1] = s;
