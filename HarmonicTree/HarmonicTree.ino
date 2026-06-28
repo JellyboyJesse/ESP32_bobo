@@ -41,7 +41,7 @@ static const int PIN_ENC_SW = 6;
 // ----------------------- Audio configuration ------------------------
 static const uint32_t SAMPLE_RATE   = 44100;
 static const int      I2S_NUM_PORT  = I2S_NUM_0;
-static const int      DMA_BUF_COUNT = 8;
+static const int      DMA_BUF_COUNT = 10;    // a little extra cushion against transient spikes
 static const int      DMA_BUF_LEN   = 256;
 static const int      BLOCK_FRAMES  = 256;
 
@@ -63,6 +63,8 @@ static volatile float gPulseAmount   = 0.80f;        // dial: 0 = pure drone, 1 
 static const float PULSE_BASE_HZ      = 1.0f;        // base pulse rate (× node ratio)
 static const float PULSE_NODE_CHANCE  = 0.70f;       // chance a (non-root) node pulses
 static const float PULSE_RANDOM_CHANCE = 0.12f;      // chance a pulsing node takes a random tempo
+// Evolving filter: slow per-voice cutoff wander (control-rate, free on audio core)
+static const float WANDER_DEPTH = 0.35f;             // ± fraction the cutoff drifts
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;
@@ -173,6 +175,8 @@ struct Voice {
   float    pulseInc;     // per-sample phase increment = rateHz / SR
   float    pulseAtk;     // attack fraction of the period
   float    pulseDepth;   // per-node participation: 0 = sustain, 1 = pulses
+  float    wanderPhase;  // slow filter-cutoff wander 0..1 (evolving filter)
+  float    wanderRate;   // wander cycles per second
   bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
@@ -212,22 +216,23 @@ static inline float voiceNextSample(int vi) {
   v.z1 = c.b1 * x - c.a1 * y + v.z2;
   v.z2 = c.b2 * x - c.a2 * y;
 
-  // rhythmic pulse: retriggering attack/decay envelope (polyrhythm layer).
-  // pe = 0..1 within the period; the dial + per-node depth set how deeply
-  // it ducks the amplitude. gPulseAmount 0 -> pure sustain (drone).
-  v.pulsePhase += v.pulseInc;
-  if (v.pulsePhase >= 1.0f) v.pulsePhase -= 1.0f;
-  float pe;
-  if (v.pulsePhase < v.pulseAtk) {
-    pe = v.pulsePhase / v.pulseAtk;                       // attack
-  } else {
-    float r = 1.0f - (v.pulsePhase - v.pulseAtk) / (1.0f - v.pulseAtk);
-    pe = r * r;                                           // decay to 0 by period end
-  }
-  float k = gPulseAmount * v.pulseDepth;
-  float pulseMod = 1.0f - k * (1.0f - pe);                // lerp(sustain, pulse)
+  float out = y * v.env;   // birth/death envelope scales the filtered signal
 
-  return y * v.env * pulseMod;   // envelope + pulse scale the filtered signal
+  // rhythmic pulse: retriggering attack/decay envelope (polyrhythm layer).
+  // Skipped entirely for sustained nodes (saves CPU at high voice counts).
+  if (v.pulseDepth > 0.0f) {
+    v.pulsePhase += v.pulseInc;
+    if (v.pulsePhase >= 1.0f) v.pulsePhase -= 1.0f;
+    float pe;
+    if (v.pulsePhase < v.pulseAtk) {
+      pe = v.pulsePhase / v.pulseAtk;                      // attack
+    } else {
+      float r = 1.0f - (v.pulsePhase - v.pulseAtk) / (1.0f - v.pulseAtk);
+      pe = r * r;                                          // decay to 0 by period end
+    }
+    out *= 1.0f - gPulseAmount * (1.0f - pe);              // lerp(sustain, pulse)
+  }
+  return out;
 }
 
 static int allocVoice() {
@@ -305,6 +310,10 @@ static void initPulse(int i) {
   v.pulseInc   = rateHz / (float)SAMPLE_RATE;
   v.pulseAtk   = 0.03f + (rngNext() % 220) * 0.001f;       // 0.03..0.25 of period
   v.pulsePhase = (rngNext() % 1000) * 0.001f;              // random start phase
+
+  // slow per-voice filter wander (evolving filter, control-rate)
+  v.wanderPhase = (rngNext() % 1000) * 0.001f;
+  v.wanderRate  = 0.03f + (rngNext() % 120) * 0.001f;      // 0.03..0.15 Hz
 }
 
 // ----------------------- Grow / prune -------------------------------
@@ -408,6 +417,9 @@ static void computeVoiceFilter(int i) {
       type = 2; Q = 0.707f;
       f0 = v.freq * (3.0f - 1.7f * open);   // born thin (high), opens lower
     }
+    // evolving filter: slow cutoff wander, unique per voice
+    f0 *= 1.0f + WANDER_DEPTH * sinf(2.0f * (float)M_PI * v.wanderPhase);
+
     if (f0 < 20.0f) f0 = 20.0f;
     float maxf = SAMPLE_RATE * 0.45f;
     if (f0 > maxf) f0 = maxf;
@@ -463,7 +475,9 @@ static void updateEnvelopes(float dt) {
     }
     sumAmp += v.baseAmp * v.env;             // current worst-case in-phase peak
     if (v.active) {
-      computeVoiceFilter(i);                 // refresh filter (env may have moved)
+      v.wanderPhase += v.wanderRate * dt;    // advance evolving-filter wander
+      if (v.wanderPhase >= 1.0f) v.wanderPhase -= 1.0f;
+      computeVoiceFilter(i);                 // refresh filter (env/wander moved)
       advanceMorph(i, dt);                   // evolution layer 1: waveform morph
     }
   }
@@ -526,11 +540,15 @@ static void i2sSetup() {
 }
 
 static int16_t gBlockBuf[BLOCK_FRAMES * 2];
+static volatile uint32_t gRenderMaxUs = 0;            // worst block render time (vs ~5805us budget)
 
 static void audioTask(void* param) {
   size_t bytesWritten;
   for (;;) {
+    uint32_t t0 = micros();
     renderBlock(gBlockBuf);
+    uint32_t us = micros() - t0;
+    if (us > gRenderMaxUs) gRenderMaxUs = us;         // CPU headroom meter
     i2s_write((i2s_port_t)I2S_NUM_PORT, gBlockBuf,
               sizeof(gBlockBuf), &bytesWritten, portMAX_DELAY);
   }
@@ -791,8 +809,10 @@ static void controlTask(void* param) {
     }
     if (now - lastFpsMs >= 1000) {
       fps = frames; frames = 0; lastFpsMs = now;
-      Serial.printf("FPS:%d heap:%u voices:%d targets:%d cursor:%d\n",
-                    fps, (unsigned)ESP.getFreeHeap(), activeCount(), gNumTargets, gCursor);
+      Serial.printf("FPS:%d heap:%u voices:%d render:%uus/5805us mix:%.2f\n",
+                    fps, (unsigned)ESP.getFreeHeap(), activeCount(),
+                    (unsigned)gRenderMaxUs, gMixGain);
+      gRenderMaxUs = 0;
     }
 
     vTaskDelay(1);   // yield (control task is the only thing on core 0)
