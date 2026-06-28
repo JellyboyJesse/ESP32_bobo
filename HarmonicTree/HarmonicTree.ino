@@ -65,6 +65,9 @@ static const float PULSE_NODE_CHANCE  = 0.70f;       // chance a (non-root) node
 static const float PULSE_RANDOM_CHANCE = 0.12f;      // chance a pulsing node takes a random tempo
 // Evolving filter: slow per-voice cutoff wander (control-rate, free on audio core)
 static const float WANDER_DEPTH = 0.35f;             // ± fraction the cutoff drifts
+// Ratio-shift glides (layer 2, 'one-off events')
+static volatile float gRetuneLiveliness   = 1.0f;    // scales how often branches retune
+static const float RETUNE_CHANCE_PER_SEC  = 0.018f;  // ~ once per 55s per branch (× liveliness)
 
 // ----------------------- Wavetable engine ---------------------------
 static const int      TABLE_BITS = 11;
@@ -177,6 +180,9 @@ struct Voice {
   float    pulseDepth;   // per-node participation: 0 = sustain, 1 = pulses
   float    wanderPhase;  // slow filter-cutoff wander 0..1 (evolving filter)
   float    wanderRate;   // wander cycles per second
+  float    glideFrom, glideTo;  // ratio-shift glide endpoints (Hz, layer 2)
+  float    glideProg;    // 0..1 along the glide; >=1 = idle
+  float    glideInc;     // progress per second = 1 / glide duration
   bool     active;       // node exists in pool (set true LAST when growing)
   float    freq;
   uint8_t  depth;
@@ -314,6 +320,9 @@ static void initPulse(int i) {
   // slow per-voice filter wander (evolving filter, control-rate)
   v.wanderPhase = (rngNext() % 1000) * 0.001f;
   v.wanderRate  = 0.03f + (rngNext() % 120) * 0.001f;      // 0.03..0.15 Hz
+
+  // ratio-shift glide starts idle
+  v.glideFrom = v.freq; v.glideTo = v.freq; v.glideProg = 1.0f; v.glideInc = 0.0f;
 }
 
 // ----------------------- Grow / prune -------------------------------
@@ -457,6 +466,37 @@ static void advanceMorph(int i, float dt) {
   }
 }
 
+// Begin a ratio-shift glide: pick a new (weighted) interval relative to the
+// parent and slide there over 2-4s. Root has no parent and never retunes.
+static void startRetune(int i) {
+  Voice& v = gVoices[i];
+  if (v.parent < 0) return;
+  float pf = gVoices[v.parent].freq;
+  int gi = chooseRatio(pf);
+  if (gi < 0) return;
+  v.glideFrom = v.freq;
+  v.glideTo   = pf * (float)kRatios[gi].num / (float)kRatios[gi].den;
+  v.rNum = kRatios[gi].num;
+  v.rDen = kRatios[gi].den;
+  v.glideProg = 0.0f;
+  v.glideInc  = 1.0f / (2.0f + (rngNext() % 2000) * 0.001f);   // 2..4s glide
+}
+
+// Advance a glide (exponential = constant-rate in pitch), or — when idle —
+// occasionally trigger a new one. Only gliding voices do the powf.
+static void advanceRetune(int i, float dt) {
+  Voice& v = gVoices[i];
+  if (v.glideProg < 1.0f) {
+    v.glideProg += v.glideInc * dt;
+    if (v.glideProg >= 1.0f) { v.glideProg = 1.0f; v.freq = v.glideTo; }
+    else v.freq = v.glideFrom * powf(v.glideTo / v.glideFrom, v.glideProg);
+    v.phaseInc = freqToInc(v.freq);            // smooth pitch slide (atomic 32-bit write)
+  } else if (i != gRootIndex && v.envTarget > 0.5f) {
+    float p = RETUNE_CHANCE_PER_SEC * gRetuneLiveliness * dt;
+    if ((float)rngNext() / 4294967296.0f < p) startRetune(i);
+  }
+}
+
 static void updateEnvelopes(float dt) {
   float sumAmp = 0.0f;
   for (int i = 0; i < NUM_VOICES; i++) {
@@ -477,7 +517,8 @@ static void updateEnvelopes(float dt) {
     if (v.active) {
       v.wanderPhase += v.wanderRate * dt;    // advance evolving-filter wander
       if (v.wanderPhase >= 1.0f) v.wanderPhase -= 1.0f;
-      computeVoiceFilter(i);                 // refresh filter (env/wander moved)
+      advanceRetune(i, dt);                  // layer 2: occasional ratio-shift glide
+      computeVoiceFilter(i);                 // refresh filter (env/wander/glide moved)
       advanceMorph(i, dt);                   // evolution layer 1: waveform morph
     }
   }
