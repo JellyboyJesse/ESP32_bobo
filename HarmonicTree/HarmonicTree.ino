@@ -220,7 +220,10 @@ struct Voice {
   float           z1, z2;      // filter state (audio core only)
 };
 
-static const int NUM_VOICES = 32;
+// Pool ceiling. Render cost is ~180us/voice + ~560us fixed; the 5805us/block
+// budget runs out near 29 voices, so 28 keeps a safe margin and stays
+// click-free at full quality (all evolution layers + stereo).
+static const int NUM_VOICES = 28;
 static Voice gVoices[NUM_VOICES];
 static int   gRootIndex = -1;
 
@@ -292,7 +295,8 @@ static bool canGrow(int v) {
   return gVoices[v].active &&
          gVoices[v].envTarget > 0.5f &&
          gVoices[v].depth < MAX_GROW_DEPTH &&
-         countChildren(v) < MAX_CHILDREN_PER_NODE;
+         countChildren(v) < MAX_CHILDREN_PER_NODE &&
+         activeCount() < NUM_VOICES;          // hide grow-slots when the pool is full
 }
 
 // Weighted ratio pick among ratios whose child stays under the ceiling.
