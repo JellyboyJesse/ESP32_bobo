@@ -773,6 +773,9 @@ static const int SCREEN_W = 128, SCREEN_H = 64;
 static const int LEFT_MARGIN = 6, COL_W = 23, TOP = 14;
 
 static int gNodeX[NUM_VOICES], gNodeY[NUM_VOICES];
+static bool gIsLeaf[NUM_VOICES];              // childless tips (drawn with a leaf)
+static bool gTuneMode = false;                // root-tuning mode (click root to enter)
+static const float MIN_ROOT = 33.0f, MAX_ROOT = 220.0f;   // root-note range (Hz)
 
 // Cursor targets: a node, or an empty grow-slot belonging to a parent.
 enum TargetType { T_NODE, T_SLOT };
@@ -813,6 +816,7 @@ static int layoutNode(int v) {
   } else {
     y = sum / nc;                              // parents centered on their children
   }
+  gIsLeaf[v] = (nc == 0);
   gNodeX[v] = LEFT_MARGIN + gVoices[v].depth * gColW;
   gNodeY[v] = y;
   return y;
@@ -859,7 +863,50 @@ static void rebuildLayout() {
   if (gCursor < 0) gCursor = 0;
 }
 
+// Nearest note name for a frequency (A4 = 440Hz).
+static void noteName(float hz, char* out, int n) {
+  static const char* names[12] =
+    {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+  int m = (int)lroundf(69.0f + 12.0f * log2f(hz / 440.0f));
+  snprintf(out, n, "%s%d", names[((m % 12) + 12) % 12], m / 12 - 1);
+}
+
+// Transpose the whole tree by a frequency factor. Because every voice is
+// root × (product of ratios), one scale factor moves all of them and keeps
+// the just-intonation relationships intact.
+static void transposeTree(float factor) {
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!gVoices[i].active) continue;
+    gVoices[i].freq      *= factor;
+    gVoices[i].glideFrom *= factor;
+    gVoices[i].glideTo   *= factor;
+  }
+}
+
+static void drawTuneScreen() {
+  display.clear();
+  display.setColor(WHITE);
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawString(0, 0, "TUNE ROOT");
+  display.drawHorizontalLine(0, 11, SCREEN_W);
+
+  float hz = gVoices[gRootIndex].freq;
+  char nb[12]; noteName(hz, nb, sizeof(nb));
+  display.setFont(ArialMT_Plain_24);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 16, nb);
+  display.setFont(ArialMT_Plain_10);
+  char buf[16]; snprintf(buf, sizeof(buf), "%.1f Hz", hz);
+  display.drawString(64, 42, buf);
+  display.drawString(64, 53, "rotate = pitch   click = done");
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.display();
+}
+
 static void drawScreen(int fps) {
+  if (gTuneMode && gRootIndex >= 0) { drawTuneScreen(); return; }
+
   display.clear();
   display.setColor(WHITE);
   Target& cur = gTargets[gCursor];
@@ -906,6 +953,13 @@ static void drawScreen(int fps) {
       if (pe > 0.6f) r += 1;                    // brief throb on the beat
     }
     display.fillCircle(gNodeX[i], gNodeY[i], r);
+
+    // a little leaf at the tips (childless nodes, depth 2+)
+    if (gIsLeaf[i] && gVoices[i].depth >= 2) {
+      int lx = gNodeX[i], ly = gNodeY[i];
+      int dir = (i & 1) ? 1 : -1;
+      display.drawLine(lx + 1, ly, lx + 4, ly + 3 * dir);
+    }
   }
 
   // --- empty grow-slots drawn as '+' marks ---
@@ -966,23 +1020,38 @@ static void controlTask(void* param) {
     int steps = sub / 4;          // truncates toward zero
     gEncSub -= steps * 4;         // keep the remainder
     interrupts();
-    if (steps != 0 && gNumTargets > 0) {
-      gCursor = (gCursor + steps) % gNumTargets;
-      if (gCursor < 0) gCursor += gNumTargets;
-      gFocusVoice = gTargets[gCursor].voice;
-      gFocusType  = gTargets[gCursor].type;
+    if (steps != 0) {
+      if (gTuneMode) {
+        // transpose the whole tree in semitone steps, clamped to root range
+        float f  = powf(2.0f, (float)steps / 12.0f);
+        float nr = gVoices[gRootIndex].freq * f;
+        if (nr < MIN_ROOT) f = MIN_ROOT / gVoices[gRootIndex].freq;
+        if (nr > MAX_ROOT) f = MAX_ROOT / gVoices[gRootIndex].freq;
+        transposeTree(f);
+      } else if (gNumTargets > 0) {
+        gCursor = (gCursor + steps) % gNumTargets;
+        if (gCursor < 0) gCursor += gNumTargets;
+        gFocusVoice = gTargets[gCursor].voice;
+        gFocusType  = gTargets[gCursor].type;
+      }
     }
 
     // --- click: grow or prune the selected target ---
     if (buttonClicked() && gNumTargets > 0) {
-      Target t = gTargets[gCursor];
-      if (t.type == T_SLOT) {
-        int nv = growBranch(t.voice);
-        if (nv >= 0) { gFocusVoice = nv; gFocusType = T_NODE; }
-      } else if (t.voice != gRootIndex) {
-        gFocusVoice = gVoices[t.voice].parent;   // cursor falls back to parent
-        gFocusType  = T_NODE;
-        pruneBranch(t.voice);
+      if (gTuneMode) {
+        gTuneMode = false;                        // click again exits tuning
+      } else {
+        Target t = gTargets[gCursor];
+        if (t.type == T_SLOT) {
+          int nv = growBranch(t.voice);
+          if (nv >= 0) { gFocusVoice = nv; gFocusType = T_NODE; }
+        } else if (t.voice == gRootIndex) {
+          gTuneMode = true;                        // click the root to tune the key
+        } else {
+          gFocusVoice = gVoices[t.voice].parent;   // cursor falls back to parent
+          gFocusType  = T_NODE;
+          pruneBranch(t.voice);
+        }
       }
     }
 
